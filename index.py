@@ -208,60 +208,78 @@ def bot_payload(raw):
     except Exception:pass
     return None
 
+def bot_video_rows(user_id,limit=8,offset=0):
+    with connect() as c:
+        return c.execute("SELECT id,title,filesize,duration,height,created_at,expires_at FROM videos WHERE bot_platform='telegram' AND bot_user_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",(str(user_id),limit,offset)).fetchall()
+
+def bot_videos_text(rows,offset=0):
+    if not rows:return "📚 Твоих сохранённых видео пока нет."
+    lines=["📚 Твои видео:",""]
+    for n,v in enumerate(rows,offset+1):
+        lines.append("%d. %s · %.1f MB"%(n,v["title"],(v["filesize"] or 0)/1024/1024))
+    return "\n".join(lines)
+
+def telegram_library_keyboard(rows):
+    buttons=[[{"text":"▶️ "+v["title"][:48],"callback_data":"view:"+v["id"]}] for v in rows]
+    if rows:buttons.append([{"text":"📚 Обновить список","callback_data":"videos:1"}])
+    return buttons
+
+def bot_send_video(token,chat_id,vid,user_id):
+    base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
+    if not base:return False
+    with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=? AND bot_platform='telegram' AND bot_user_id=?",(vid,str(user_id))).fetchone()
+    if not v or not (MEDIA/v["filename"]).is_file():return False
+    try:
+        d=telegram_call(token,"sendVideo",{"chat_id":chat_id,"video":base+"/media/"+vid,"caption":v["title"][:1024],"supports_streaming":True})
+        return bool(d.get("ok"))
+    except Exception as e:
+        log.warning("Telegram video send failed: %s",e);return False
+
 def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
     text=(text or "").strip();parts=text.split()
     payload=bot_payload(payload)
+    if platform!="telegram":return
     if payload:
         action=str(payload.get("cmd") or payload.get("inhhab") or "")
         value=str(payload.get("value",""))
         if action=="q":
-            save_bot_session(platform,user_id,quality=value)
-            keyboard=tg_container_keyboard() if platform=="telegram" else vk_choice_buttons([("MP4","mp4"),("WebM","webm")],"c")
-            reply("Качество: "+value+"p\n\nТеперь выбери формат:",keyboard)
-            return
+            save_bot_session(platform,user_id,quality=value);reply("Качество: "+value+"p\n\nТеперь выбери формат:",tg_container_keyboard());return
         if action=="c":
             if value not in {"mp4","webm"}:reply("Некорректный формат.");return
-            save_bot_session(platform,user_id,container=value)
-            items=[("12 часов","12"),("24 часа","24"),("3 дня","72"),("7 дней","168"),("30 дней","720"),("Бессрочно","never")]
-            keyboard=tg_ttl_keyboard() if platform=="telegram" else vk_choice_buttons(items,"t")
-            reply("Формат: "+value.upper()+"\n\nТеперь выбери срок хранения:",keyboard)
-            return
+            save_bot_session(platform,user_id,container=value);reply("Формат: "+value.upper()+"\n\nТеперь выбери срок хранения:",tg_ttl_keyboard());return
         if action=="t":
-            ttl_map={"12":"12","24":"24","72":"72","168":"168","720":"720","never":"never"}
-            if value not in ttl_map:reply("Некорректный срок хранения.");return
-            save_bot_session(platform,user_id,ttl_hours=ttl_value(ttl_map[value]))
+            if value not in {"12","24","72","168","720","never"}:reply("Некорректный срок хранения.");return
+            save_bot_session(platform,user_id,ttl_hours=ttl_value(value))
             s=bot_session(platform,user_id);q=s["quality"] or "best";container=s["container"] or "mp4";label="бессрочно" if s["ttl_hours"] is None else str(s["ttl_hours"])+" ч."
-            keyboard=[[{"text":"⬇️ Скачать","callback_data":"go:1"}]] if platform=="telegram" else vk_choice_buttons([("⬇️ Скачать","1")],"go")
-            reply("Готово к загрузке.\n\nКачество: "+(q+"p" if q!="best" else "лучшее")+"\nФормат: "+container.upper()+"\nХранение: "+label,keyboard)
-            return
+            reply("Готово к загрузке.\n\nКачество: "+("лучшее" if q=="best" else q+"p")+"\nФормат: "+container.upper()+"\nХранение: "+label,[[{"text":"⬇️ Скачать","callback_data":"go:1"}]]);return
         if action=="go":
-            try:
-                jid=bot_create_job(platform,user_id)
-                reply("Задача добавлена: "+jid+"\n\nЯ сообщу, когда видео будет готово.")
+            try:bot_create_job(platform,user_id,chat_id);reply("Задача добавлена.\n\nЯ сообщу, когда видео будет готово.")
             except Exception as e:reply("Ошибка: "+str(e))
             return
-    if not parts:
-        if text.startswith("http"):return bot_start_download(platform,user_id,text,reply)
-        return
+        if action=="videos":
+            rows=bot_video_rows(user_id);reply(bot_videos_text(rows),telegram_library_keyboard(rows));return
+        if action=="view":
+            if bot_send_video(setting("telegram_token"),chat_id,value,user_id):return
+            base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
+            if base:reply("Видео готово. Открой просмотр:",[[{"text":"▶️ Смотреть","url":base+"/video/"+value},{"text":"⬇️ Скачать","url":base+"/download/"+value}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+            else:reply("Для просмотра из чата нужен PUBLIC_BASE_URL, доступный Telegram.")
+            return
+    if not parts:return
     cmd=parts[0].split("@",1)[0].lower()
     if cmd in {"/start","/help","help"}:
-        reply("inhHAB bot.\n\nДоступ: /access KEY\n\nПосле авторизации просто отправь ссылку на YouTube или PornHub. Бот сам предложит качество, формат и срок хранения.");return
+        reply("inhHAB bot.\n\n/access KEY — открыть доступ\n/videos — мои сохранённые видео\n/status — статус загрузок\n\nПосле авторизации отправь ссылку на YouTube или PornHub.");return
     if cmd in {"/access","/key"}:
         if len(parts)<2:reply("Использование: /access KEY");return
         reply("Доступ выдан. Теперь просто отправь ссылку." if bot_authorize(platform,user_id,parts[1]) else "Неверный ключ доступа.");return
-    if not bot_user_allowed(platform,user_id):reply("Доступ закрыт. Сначала введи /access KEY.");return
-    if text.startswith("http"):
-        bot_start_download(platform,user_id,text,reply);return
+    if not bot_user_allowed(platform,user_id):
+        reply("Доступ закрыт. Сначала введи /access KEY.");return
+    if cmd in {"/videos","/library"}:
+        rows=bot_video_rows(user_id);reply(bot_videos_text(rows),telegram_library_keyboard(rows));return
     if cmd=="/status":
-        with connect() as c:rows=c.execute("SELECT status,COUNT(*) n FROM jobs WHERE id IN (SELECT job_id FROM bot_requests WHERE platform=? AND user_id=?) GROUP BY status",(platform,str(user_id))).fetchall()
+        with connect() as c:rows=c.execute("SELECT status,COUNT(*) n FROM jobs WHERE id IN (SELECT job_id FROM bot_requests WHERE platform='telegram' AND user_id=?) GROUP BY status",(str(user_id),)).fetchall()
         reply("Твои задачи: "+"; ".join("%s=%s"%(r["status"],r["n"]) for r in rows) or "задач нет");return
-    if text in {"MP4","WebM"}:
-        save_bot_session(platform,user_id,container=text.lower());reply("Формат: "+text+"\n\nВыбери срок хранения:",vk_choice_buttons([("12 часов","12"),("24 часа","24"),("3 дня","72"),("7 дней","168"),("30 дней","720"),("Бессрочно","never")],"t") if platform=="vk" else tg_ttl_keyboard());return
-    if text=="⬇️ Скачать":
-        try:jid=bot_create_job(platform,user_id);reply("Задача добавлена: "+jid+"\n\nЯ сообщу, когда видео будет готово.")
-        except Exception as e:reply("Ошибка: "+str(e))
-        return
-    reply("Отправь ссылку или используй /help")
+    if text.startswith("http"):bot_start_download(platform,user_id,chat_id,text,reply);return
+    reply("Отправь ссылку или используй /videos")
 
 def notify_bot_request(job_id,text):
     with connect() as c:r=c.execute("SELECT platform,user_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
