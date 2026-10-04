@@ -77,6 +77,105 @@ def setting(k):
     with connect() as c:r=c.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone()
     return r["value"] if r else None
 def configured():return bool(setting("admin_password_hash"))
+def bot_access_key():
+    v=setting("bot_access_key")
+    if v:return v
+    v=secrets.token_urlsafe(18);set_setting("bot_access_key",v);return v
+
+def bot_enabled(platform):return setting(platform+"_enabled")=="1"
+
+def http_json(url,payload=None,timeout=35):
+    data=json.dumps(payload or {}).encode("utf-8")
+    req=urllib.request.Request(url,data=data,headers={"Content-Type":"application/json","User-Agent":"inhHAB/1.0"})
+    with urllib.request.urlopen(req,timeout=timeout) as r:return json.loads(r.read().decode("utf-8"))
+
+def bot_user_allowed(platform,user_id):
+    with connect() as c:r=c.execute("SELECT 1 FROM bot_users WHERE platform=? AND user_id=?",(platform,str(user_id))).fetchone()
+    return bool(r)
+
+def bot_authorize(platform,user_id,key):
+    if not hmac.compare_digest(str(key or ""),bot_access_key()):return False
+    with connect() as c:c.execute("INSERT OR IGNORE INTO bot_users(platform,user_id,created_at) VALUES(?,?,?)",(platform,str(user_id),iso(now())))
+    return True
+
+def bot_register_request(job_id,platform,user_id):
+    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_requests(job_id,platform,user_id) VALUES(?,?,?)",(job_id,platform,str(user_id)))
+
+def telegram_call(token,method,payload):return http_json("https://api.telegram.org/bot%s/%s"%(token,method),payload)
+def telegram_send(token,chat_id,text):return telegram_call(token,"sendMessage",{"chat_id":chat_id,"text":text})
+
+def vk_api(token,method,payload):
+    p=dict(payload or {});p.update({"access_token":token,"v":"5.199"});return http_json("https://api.vk.com/method/"+method,p)
+def vk_send(token,peer_id,text):return vk_api(token,"messages.send",{"peer_id":peer_id,"random_id":0,"message":text})
+
+def notify_bot_request(job_id,text):
+    with connect() as c:r=c.execute("SELECT platform,user_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
+    if not r:return
+    try:
+        if r["platform"]=="telegram" and setting("telegram_token"):telegram_send(setting("telegram_token"),r["user_id"],text)
+        elif r["platform"]=="vk" and setting("vk_token"):vk_send(setting("vk_token"),r["user_id"],text)
+    except Exception as e:log.warning("bot notification failed: %s",e)
+
+def handle_bot_text(platform,chat_id,user_id,text,reply):
+    text=(text or "").strip();parts=text.split()
+    if not parts:return
+    cmd=parts[0].split("@",1)[0].lower()
+    if cmd in {"/start","/help","help"}:
+        reply("inhHAB bot. Доступ: /access KEY\nСкачать: /download URL [quality] [mp4|webm] [ttl]\nСтатус: /status");return
+    if cmd in {"/access","/key"}:
+        if len(parts)<2:reply("Использование: /access KEY");return
+        reply("Доступ выдан." if bot_authorize(platform,user_id,parts[1]) else "Неверный ключ доступа.");return
+    if not bot_user_allowed(platform,user_id):reply("Доступ закрыт. Сначала введи /access KEY.");return
+    if cmd=="/status":
+        with connect() as c:rows=c.execute("SELECT status,COUNT(*) n FROM jobs GROUP BY status").fetchall()
+        reply("Статус: "+"; ".join("%s=%s"%(r["status"],r["n"]) for r in rows) or "задач нет");return
+    if cmd=="/download":
+        if len(parts)<2:reply("Использование: /download URL [quality] [mp4|webm] [ttl]");return
+        url=parts[1];q=parts[2] if len(parts)>2 else "best";container=parts[3].lower() if len(parts)>3 else "mp4";ttl=parts[4] if len(parts)>4 else "12"
+        try:
+            validate_url(url)
+            if container not in {"mp4","webm"}:raise ValueError("контейнер должен быть mp4 или webm")
+            if q!="best" and not (1<=int(q)<=4320):raise ValueError("некорректное разрешение")
+            ttlh=ttl_value(ttl);jid=uuid.uuid4().hex
+            with connect() as c:c.execute("INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,"queued",?)",(jid,url,q,container,ttlh,iso(now())))
+            bot_register_request(jid,platform,user_id);reply("Задача добавлена: "+jid+"\nСтатус: /status")
+        except Exception as e:reply("Ошибка: "+str(e))
+        return
+    reply("Неизвестная команда. /help")
+
+def telegram_loop():
+    offset=None
+    while True:
+        token=setting("telegram_token")
+        if not token or not bot_enabled("telegram"):time.sleep(3);continue
+        try:
+            payload={"timeout":25,"limit":50};payload.update({"offset":offset} if offset is not None else {})
+            data=telegram_call(token,"getUpdates",payload)
+            if not data.get("ok"):raise RuntimeError(data.get("description","Telegram API error"))
+            for upd in data.get("result",[]):
+                offset=upd["update_id"]+1;msg=upd.get("message") or upd.get("edited_message")
+                if msg:handle_bot_text("telegram",str(msg["chat"]["id"]),str(msg.get("from",{}).get("id","")),msg.get("text",""),lambda t:telegram_send(token,msg["chat"]["id"],t))
+        except Exception as e:log.warning("Telegram bot loop: %s",e);time.sleep(5)
+
+def vk_loop():
+    ts=server=key=None
+    while True:
+        token=setting("vk_token");group_id=setting("vk_group_id")
+        if not token or not group_id or not bot_enabled("vk"):time.sleep(3);continue
+        try:
+            if not server:
+                d=vk_api(token,"groups.getLongPollServer",{"group_id":group_id})
+                if "error" in d:raise RuntimeError(str(d["error"]))
+                server=d["response"]["server"];key=d["response"]["key"];ts=d["response"]["ts"]
+            u=server+"?act=a_check&key="+urllib.parse.quote(key)+"&wait=25&ts="+urllib.parse.quote(ts)
+            with urllib.request.urlopen(u,timeout=35) as r:data=json.loads(r.read().decode("utf-8"))
+            if data.get("failed"):server=None;continue
+            ts=data.get("ts",ts)
+            for upd in data.get("updates",[]):
+                if upd.get("type")!="message_new":continue
+                o=upd.get("object") or {};text=o.get("text","");peer=str(o.get("peer_id") or o.get("from_id") or "");uid=str(o.get("from_id") or peer)
+                handle_bot_text("vk",peer,uid,text,lambda t:vk_send(token,peer,t))
+        except Exception as e:log.warning("VK bot loop: %s",e);server=None;time.sleep(5)
 def is_admin():return session.get("is_admin") is True
 
 def admin_only(view):
@@ -213,9 +312,10 @@ def run_job(job_id):
         with connect() as c:
             c.execute("INSERT INTO videos(id,title,source_url,source,filename,mime_type,filesize,duration,width,height,uploader,thumbnail,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(vid,(info.get("title") or final.stem).strip(),job["url"],source_name(job["url"]),final.name,"video/"+final.suffix.lstrip("."),final.stat().st_size,info.get("duration"),info.get("width"),info.get("height"),info.get("uploader") or info.get("channel"),thumb,iso(now()),expires(job["ttl_hours"])))
             c.execute("UPDATE jobs SET status='done',progress=100,title=?,video_id=?,finished_at=? WHERE id=?",(info.get("title") or final.stem,vid,iso(now()),job_id))
+        notify_bot_request(job_id,"Готово: "+(info.get("title") or final.stem)+"\nВидео: /video/"+vid)
         log.info("job %s completed: %s",job_id,info.get("title") or final.stem)
     except Exception as e:
-        msg=str(e)[-1600:];log.exception("job %s failed",job_id)
+        msg=str(e)[-1600:];notify_bot_request(job_id,"Ошибка загрузки: "+msg[-1000:]);log.exception("job %s failed",job_id)
         with connect() as c:c.execute("UPDATE jobs SET status='error',error=?,finished_at=? WHERE id=?",(msg,iso(now()),job_id))
     finally:shutil.rmtree(folder,ignore_errors=True)
 
@@ -234,7 +334,7 @@ def cleaner():
                 c.execute("DELETE FROM videos WHERE id=?",(r["id"],))
                 log.info("expired video removed: %s",r["id"])
         time.sleep(60)
-threading.Thread(target=worker,daemon=True).start();threading.Thread(target=cleaner,daemon=True).start()
+threading.Thread(target=worker,daemon=True).start();threading.Thread(target=cleaner,daemon=True).start();threading.Thread(target=telegram_loop,daemon=True).start();threading.Thread(target=vk_loop,daemon=True).start()
 
 @app.route("/setup",methods=["GET","POST"])
 def setup():
