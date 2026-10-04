@@ -72,6 +72,7 @@ with connect() as c:
     CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,created_at);
     CREATE TABLE IF NOT EXISTS bot_users(platform TEXT NOT NULL,user_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
     CREATE TABLE IF NOT EXISTS bot_requests(job_id TEXT PRIMARY KEY,platform TEXT NOT NULL,user_id TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS bot_sessions(platform TEXT NOT NULL,user_id TEXT NOT NULL,url TEXT NOT NULL,title TEXT,quality TEXT,container TEXT,ttl_hours INTEGER,qualities_json TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
     """)
 
 def setting(k):
@@ -105,14 +106,121 @@ def bot_register_request(job_id,platform,user_id):
     with connect() as c:c.execute("INSERT OR REPLACE INTO bot_requests(job_id,platform,user_id) VALUES(?,?,?)",(job_id,platform,str(user_id)))
 
 def telegram_call(token,method,payload):return http_json("https://api.telegram.org/bot%s/%s"%(token,method),payload)
-def telegram_send(token,chat_id,text):return telegram_call(token,"sendMessage",{"chat_id":chat_id,"text":text})
+def telegram_send(token,chat_id,text,keyboard=None):
+    p={"chat_id":chat_id,"text":text}
+    if keyboard:p["reply_markup"]={"inline_keyboard":keyboard}
+    return telegram_call(token,"sendMessage",p)
 
 def vk_api(token,method,payload):
     p=dict(payload or {});p.update({"access_token":token,"v":"5.199"})
     data=urllib.parse.urlencode(p).encode("utf-8")
     req=urllib.request.Request("https://api.vk.com/method/"+method,data=data,headers={"Content-Type":"application/x-www-form-urlencoded","User-Agent":"inhHAB/1.0"})
     with urllib.request.urlopen(req,timeout=35) as r:return json.loads(r.read().decode("utf-8"))
-def vk_send(token,peer_id,text):return vk_api(token,"messages.send",{"peer_id":peer_id,"random_id":0,"message":text})
+def vk_send(token,peer_id,text,keyboard=None):
+    p={"peer_id":peer_id,"random_id":0,"message":text}
+    if keyboard:p["keyboard"]=json.dumps({"one_time":False,"inline":True,"buttons":keyboard},ensure_ascii=False)
+    return vk_api(token,"messages.send",p)
+
+def bot_session(platform,user_id):
+    with connect() as c:r=c.execute("SELECT * FROM bot_sessions WHERE platform=? AND user_id=?",(platform,str(user_id))).fetchone()
+    return r
+
+def save_bot_session(platform,user_id,**kw):
+    old=bot_session(platform,user_id)
+    vals={"url":"","title":"","quality":"","container":"","ttl_hours":None,"qualities_json":"[]"}
+    if old:vals.update(dict(old))
+    vals.update(kw)
+    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_sessions(platform,user_id,url,title,quality,container,ttl_hours,qualities_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(platform,str(user_id),vals["url"],vals["title"],vals["quality"],vals["container"],vals["ttl_hours"],vals["qualities_json"],iso(now())))
+
+def clear_bot_session(platform,user_id):
+    with connect() as c:c.execute("DELETE FROM bot_sessions WHERE platform=? AND user_id=?",(platform,str(user_id)))
+
+def bot_quality_options(info):
+    hs=qualities(info)
+    return hs or ["best"]
+
+def bot_create_job(platform,user_id):
+    s=bot_session(platform,user_id)
+    if not s or not s["url"]:raise ValueError("Сессия выбора устарела. Отправь ссылку ещё раз.")
+    q=s["quality"] or "best";container=s["container"] or "mp4";ttl=s["ttl_hours"]
+    jid=uuid.uuid4().hex
+    with connect() as c:c.execute("INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,'queued',?)",(jid,s["url"],q,container,ttl,iso(now())))
+    bot_register_request(jid,platform,user_id);clear_bot_session(platform,user_id);return jid
+
+def tg_quality_keyboard(options):
+    rows=[];row=[]
+    for q in options:
+        row.append({"text":str(q)+"p","callback_data":"q:"+str(q)})
+        if len(row)==3:rows.append(row);row=[]
+    if row:rows.append(row)
+    return rows
+
+def tg_container_keyboard():
+    return [[{"text":"MP4","callback_data":"c:mp4"},{"text":"WebM","callback_data":"c:webm"}]]
+
+def tg_ttl_keyboard():
+    return [[{"text":"12 часов","callback_data":"t:12"},{"text":"24 часа","callback_data":"t:24"}],[{"text":"3 дня","callback_data":"t:72"},{"text":"7 дней","callback_data":"t:168"}],[{"text":"30 дней","callback_data":"t:720"},{"text":"Бессрочно","callback_data":"t:never"}]]
+
+def vk_buttons(options):
+    return [[{"action":{"type":"text","label":str(q)+"p","payload":json.dumps({"inhhab":"q","value":str(q)})}} for q in options[:6]]]
+
+def vk_text_buttons(labels):
+    return [[{"action":{"type":"text","label":x,"payload":json.dumps({"inhhab":"text","value":x})}} for x in labels]]
+
+def bot_start_download(platform,user_id,url,reply):
+    try:
+        validate_url(url)
+        reply("Получаю метаданные…")
+        info=info_for(url)
+        opts=bot_quality_options(info)
+        save_bot_session(platform,user_id,url=url,title=info.get("title") or "",qualities_json=json.dumps(opts))
+        if platform=="telegram":
+            reply("Видео: %s\\nВыбери качество:"%(info.get("title") or "без названия"),tg_quality_keyboard(opts))
+        else:
+            reply("Видео: %s\\nВыбери качество:"%(info.get("title") or "без названия"),vk_buttons(opts))
+    except Exception as e:
+        reply("Ошибка получения метаданных: "+str(e))
+
+def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
+    text=(text or "").strip();parts=text.split()
+    if payload:
+        action=payload.get("inhhab");value=str(payload.get("value",""))
+        if action=="q":
+            save_bot_session(platform,user_id,quality=value)
+            reply("Качество: %sp\\nТеперь выбери формат:"%value,tg_container_keyboard() if platform=="telegram" else vk_text_buttons(["MP4","WebM"]))
+            return
+        if action=="text" and value in {"MP4","WebM"}:
+            save_bot_session(platform,user_id,container=value.lower())
+            reply("Формат: %s\\nТеперь выбери срок хранения:"%value,tg_ttl_keyboard() if platform=="telegram" else vk_text_buttons(["12 часов","24 часа","3 дня","7 дней","30 дней","Бессрочно"]))
+            return
+    if not parts:
+        if text.startswith("http"):return bot_start_download(platform,user_id,text,reply)
+        return
+    cmd=parts[0].split("@",1)[0].lower()
+    if cmd in {"/start","/help","help"}:
+        reply("inhHAB bot.\\nДоступ: /access KEY\\nПросто отправь ссылку на YouTube или PornHub, после чего бот даст кнопки качества, формата и срока хранения.");return
+    if cmd in {"/access","/key"}:
+        if len(parts)<2:reply("Использование: /access KEY");return
+        reply("Доступ выдан. Теперь просто отправь ссылку." if bot_authorize(platform,user_id,parts[1]) else "Неверный ключ доступа.");return
+    if not bot_user_allowed(platform,user_id):reply("Доступ закрыт. Сначала введи /access KEY.");return
+    if text.startswith("http"):
+        bot_start_download(platform,user_id,text,reply);return
+    if cmd=="/status":
+        with connect() as c:rows=c.execute("SELECT status,COUNT(*) n FROM jobs WHERE id IN (SELECT job_id FROM bot_requests WHERE platform=? AND user_id=?) GROUP BY status",(platform,str(user_id))).fetchall()
+        reply("Твои задачи: "+"; ".join("%s=%s"%(r["status"],r["n"]) for r in rows) or "задач нет");return
+    if text in {"MP4","WebM"}:
+        save_bot_session(platform,user_id,container=text.lower());reply("Формат: %s\\nВыбери срок хранения:"%text,vk_text_buttons(["12 часов","24 часа","3 дня","7 дней","30 дней","Бессрочно"]) if platform=="vk" else tg_ttl_keyboard());return
+    ttl_map={"12 часов":"12","24 часа":"24","3 дня":"72","7 дней":"168","30 дней":"720","Бессрочно":"never"}
+    if text in ttl_map:
+        save_bot_session(platform,user_id,ttl_hours=ttl_value(ttl_map[text]))
+        s=bot_session(platform,user_id);q=s["quality"] or "best";container=s["container"] or "mp4";label="бессрочно" if s["ttl_hours"] is None else str(s["ttl_hours"])+" ч."
+        keyboard=[[{"text":"⬇️ Скачать","callback_data":"go:1"}]] if platform=="telegram" else vk_text_buttons(["⬇️ Скачать"])
+        reply("Готово к загрузке.\\nКачество: %s\\nФормат: %s\\nХранение: %s"%(q+"p" if q!="best" else "лучшее",container.upper(),label),keyboard);return
+    if text=="⬇️ Скачать":
+        try:jid=bot_create_job(platform,user_id);reply("Задача добавлена: "+jid+"\\nЯ сообщу, когда видео будет готово.")
+        except Exception as e:reply("Ошибка: "+str(e))
+        return
+    reply("Отправь ссылку или используй /help")
 
 def notify_bot_request(job_id,text):
     with connect() as c:r=c.execute("SELECT platform,user_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
@@ -121,33 +229,6 @@ def notify_bot_request(job_id,text):
         if r["platform"]=="telegram" and setting("telegram_token"):telegram_send(setting("telegram_token"),r["user_id"],text)
         elif r["platform"]=="vk" and setting("vk_token"):vk_send(setting("vk_token"),r["user_id"],text)
     except Exception as e:log.warning("bot notification failed: %s",e)
-
-def handle_bot_text(platform,chat_id,user_id,text,reply):
-    text=(text or "").strip();parts=text.split()
-    if not parts:return
-    cmd=parts[0].split("@",1)[0].lower()
-    if cmd in {"/start","/help","help"}:
-        reply("inhHAB bot. Доступ: /access KEY\nСкачать: /download URL [quality] [mp4|webm] [ttl]\nСтатус: /status");return
-    if cmd in {"/access","/key"}:
-        if len(parts)<2:reply("Использование: /access KEY");return
-        reply("Доступ выдан." if bot_authorize(platform,user_id,parts[1]) else "Неверный ключ доступа.");return
-    if not bot_user_allowed(platform,user_id):reply("Доступ закрыт. Сначала введи /access KEY.");return
-    if cmd=="/status":
-        with connect() as c:rows=c.execute("SELECT status,COUNT(*) n FROM jobs GROUP BY status").fetchall()
-        reply("Статус: "+"; ".join("%s=%s"%(r["status"],r["n"]) for r in rows) or "задач нет");return
-    if cmd=="/download":
-        if len(parts)<2:reply("Использование: /download URL [quality] [mp4|webm] [ttl]");return
-        url=parts[1];q=parts[2] if len(parts)>2 else "best";container=parts[3].lower() if len(parts)>3 else "mp4";ttl=parts[4] if len(parts)>4 else "12"
-        try:
-            validate_url(url)
-            if container not in {"mp4","webm"}:raise ValueError("контейнер должен быть mp4 или webm")
-            if q!="best" and not (1<=int(q)<=4320):raise ValueError("некорректное разрешение")
-            ttlh=ttl_value(ttl);jid=uuid.uuid4().hex
-            with connect() as c:c.execute("INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,'queued',?)",(jid,url,q,container,ttlh,iso(now())))
-            bot_register_request(jid,platform,user_id);reply("Задача добавлена: "+jid+"\nСтатус: /status")
-        except Exception as e:reply("Ошибка: "+str(e))
-        return
-    reply("Неизвестная команда. /help")
 
 def telegram_loop():
     offset=None;ready_token=None
@@ -162,8 +243,18 @@ def telegram_loop():
             data=telegram_call(token,"getUpdates",payload)
             if not data.get("ok"):raise RuntimeError(data.get("description","Telegram API error"))
             for upd in data.get("result",[]):
-                offset=upd["update_id"]+1;msg=upd.get("message") or upd.get("edited_message")
-                if msg:handle_bot_text("telegram",str(msg["chat"]["id"]),str(msg.get("from",{}).get("id","")),msg.get("text",""),lambda t:telegram_send(token,msg["chat"]["id"],t))
+                offset=upd["update_id"]+1
+                msg=upd.get("message") or upd.get("edited_message")
+                if msg:
+                    handle_bot_text("telegram",str(msg["chat"]["id"]),str(msg.get("from",{}).get("id","")),msg.get("text",""),lambda t,k=None:telegram_send(token,msg["chat"]["id"],t,k))
+                cb=upd.get("callback_query")
+                if cb:
+                    data_cb=cb.get("data","");parts_cb=data_cb.split(":",1)
+                    payload_cb={"inhhab":parts_cb[0],"value":parts_cb[1] if len(parts_cb)>1 else ""}
+                    chat_id=str(cb.get("message",{}).get("chat",{}).get("id",""));uid=str(cb.get("from",{}).get("id",""))
+                    if chat_id:
+                        telegram_call(token,"answerCallbackQuery",{"callback_query_id":cb.get("id")})
+                        handle_bot_text("telegram",chat_id,uid,"",lambda t,k=None:telegram_send(token,chat_id,t,k),payload_cb)
         except Exception as e:log.warning("Telegram bot loop: %s",e);time.sleep(5)
 
 def vk_loop():
@@ -189,7 +280,11 @@ def vk_loop():
             for upd in data.get("updates",[]):
                 if upd.get("type")!="message_new":continue
                 o=upd.get("object") or {};text=o.get("text","");peer=str(o.get("peer_id") or o.get("from_id") or "");uid=str(o.get("from_id") or peer)
-                handle_bot_text("vk",peer,uid,text,lambda t:vk_send(token,peer,t))
+                payload=None
+                try:
+                    raw=o.get("payload");payload=json.loads(raw) if isinstance(raw,str) else raw
+                except Exception:pass
+                handle_bot_text("vk",peer,uid,text,lambda t,k=None:vk_send(token,peer,t,k),payload)
         except Exception as e:log.warning("VK bot loop: %s",e);server=None;time.sleep(5)
 def is_admin():return session.get("is_admin") is True
 
