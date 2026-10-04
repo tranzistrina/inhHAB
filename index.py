@@ -119,25 +119,6 @@ def telegram_send(token,chat_id,text,keyboard=None):
     if keyboard:p["reply_markup"]={"inline_keyboard":keyboard}
     return telegram_call(token,"sendMessage",p)
 
-def vk_api(token,method,payload):
-    p=dict(payload or {});p.update({"access_token":token,"v":"5.199"})
-    data=urllib.parse.urlencode(p).encode("utf-8")
-    req=urllib.request.Request("https://api.vk.com/method/"+method,data=data,headers={"Content-Type":"application/x-www-form-urlencoded","User-Agent":"inhHAB/1.0"})
-    with urllib.request.urlopen(req,timeout=35) as r:return json.loads(r.read().decode("utf-8"))
-def vk_group_id_from_token(token):
-    d=vk_api(token,"groups.getById",{})
-    if "error" in d:raise RuntimeError("VK groups.getById: "+str(d["error"]))
-    groups=(d.get("response") or {}).get("groups") or []
-    if not groups:raise RuntimeError("VK API не вернул сообщество для этого токена.")
-    gid=str(groups[0].get("id") or "")
-    if not gid:raise RuntimeError("VK API не вернул ID сообщества.")
-    return gid
-
-def vk_send(token,peer_id,text,keyboard=None):
-    p={"peer_id":peer_id,"random_id":0,"message":text}
-    if keyboard:p["keyboard"]=json.dumps({"one_time":False,"inline":True,"buttons":keyboard},ensure_ascii=False)
-    return vk_api(token,"messages.send",p)
-
 def bot_session(platform,user_id):
     with connect() as c:r=c.execute("SELECT * FROM bot_sessions WHERE platform=? AND user_id=?",(platform,str(user_id))).fetchone()
     return r
@@ -330,30 +311,6 @@ def telegram_loop():
                         handle_bot_text("telegram",chat_id,uid,"",lambda t,k=None:telegram_send(token,chat_id,t,k),payload_cb)
         except Exception as e:log.warning("Telegram bot loop: %s",e);time.sleep(5)
 
-def vk_loop():
-    ts=server=key=None
-    while True:
-        token=setting("vk_token")
-        if not token or not bot_enabled("vk"):time.sleep(3);continue
-        try:
-            if not server:
-                group_id=vk_group_id_from_token(token)
-                d=vk_api(token,"groups.getLongPollServer",{"group_id":group_id})
-                if "error" in d:raise RuntimeError(str(d["error"]))
-                server=d["response"]["server"];key=d["response"]["key"];ts=d["response"]["ts"]
-            u=server+"?act=a_check&key="+urllib.parse.quote(key)+"&wait=25&ts="+urllib.parse.quote(ts)
-            with urllib.request.urlopen(u,timeout=35) as r:data=json.loads(r.read().decode("utf-8"))
-            if data.get("failed"):server=None;continue
-            ts=data.get("ts",ts)
-            for upd in data.get("updates",[]):
-                if upd.get("type")!="message_new":continue
-                o=upd.get("object") or {};text=o.get("text","");peer=str(o.get("peer_id") or o.get("from_id") or "");uid=str(o.get("from_id") or peer)
-                payload=None
-                try:
-                    raw=o.get("payload");payload=json.loads(raw) if isinstance(raw,str) else raw
-                except Exception:pass
-                handle_bot_text("vk",peer,uid,text,lambda t,k=None:vk_send(token,peer,t,k),payload)
-        except Exception as e:log.warning("VK bot loop: %s",e);server=None;time.sleep(5)
 def is_admin():return session.get("is_admin") is True
 
 def admin_only(view):
@@ -513,7 +470,7 @@ def cleaner():
                 c.execute("DELETE FROM videos WHERE id=?",(r["id"],))
                 log.info("expired video removed: %s",r["id"])
         time.sleep(60)
-threading.Thread(target=worker,daemon=True).start();threading.Thread(target=cleaner,daemon=True).start();threading.Thread(target=telegram_loop,daemon=True).start();threading.Thread(target=vk_loop,daemon=True).start()
+threading.Thread(target=worker,daemon=True).start();threading.Thread(target=cleaner,daemon=True).start();threading.Thread(target=telegram_loop,daemon=True).start()
 
 @app.route("/setup",methods=["GET","POST"])
 def setup():
@@ -551,39 +508,26 @@ def index():
 @admin_only
 def api_bots():
     if request.method=="GET":
-        return jsonify(ok=True,telegram_enabled=setting("telegram_enabled")=="1",telegram_token_set=bool(setting("telegram_token")),vk_enabled=setting("vk_enabled")=="1",vk_token_set=bool(setting("vk_token")),vk_group_id=setting("vk_group_id") or "",bot_access_key=bot_access_key())
+        return jsonify(ok=True,telegram_enabled=setting("telegram_enabled")=="1",telegram_token_set=bool(setting("telegram_token")),bot_access_key=bot_access_key(),public_base_url=setting("public_base_url") or os.getenv("PUBLIC_BASE_URL",""))
     data=request.get_json(silent=True) or request.form
     if "telegram_enabled" in data:set_setting("telegram_enabled","1" if str(data.get("telegram_enabled")).lower() in {"1","true","on","yes"} else "0")
     if "telegram_token" in data and str(data.get("telegram_token","")).strip():set_setting("telegram_token",str(data.get("telegram_token")).strip())
-    if "vk_enabled" in data:set_setting("vk_enabled","1" if str(data.get("vk_enabled")).lower() in {"1","true","on","yes"} else "0")
-    if "vk_token" in data and str(data.get("vk_token","")).strip():set_setting("vk_token",str(data.get("vk_token")).strip())
-    if "vk_group_id" in data:set_setting("vk_group_id",str(data.get("vk_group_id","")).strip())
-    if "bot_access_key" in data and str(data.get("bot_access_key","")).strip():set_setting("bot_access_key",str(data.get("bot_access_key")).strip())
+    if "public_base_url" in data:set_setting("public_base_url",str(data.get("public_base_url","")).strip().rstrip("/"))
+    if "bot_access_key" in data and str(data.get("bot_access_key","")).strip():set_setting("bot_access_key",str(data.get("bot_access_key","")).strip())
     if str(data.get("rotate_access_key","")).lower() in {"1","true","yes"}:set_setting("bot_access_key",secrets.token_urlsafe(18))
-    log.info("bot settings updated")
-    return jsonify(ok=True,bot_access_key=bot_access_key())
+    return jsonify(ok=True,bot_access_key=bot_access_key(),public_base_url=setting("public_base_url") or os.getenv("PUBLIC_BASE_URL",""))
+
 @app.route("/api/bots/test",methods=["POST"])
 @admin_only
 def api_bots_test():
-    data=request.get_json(silent=True) or request.form
-    platform=str(data.get("platform","")).lower()
     try:
-        if platform=="telegram":
-            token=setting("telegram_token")
-            if not token:raise ValueError("Telegram токен не задан.")
-            d=telegram_call(token,"getMe",{})
-            if not d.get("ok"):raise RuntimeError(d.get("description","Telegram API error"))
-            return jsonify(ok=True,message="Telegram API доступен: @"+d["result"].get("username",""))
-        if platform=="vk":
-            token=setting("vk_token")
-            if not token:raise ValueError("VK токен не задан.")
-            gid=vk_group_id_from_token(token)
-            d=vk_api(token,"groups.getLongPollServer",{"group_id":gid})
-            if "error" in d:raise RuntimeError(str(d["error"]))
-            return jsonify(ok=True,message="VK API доступен, сообщество #"+gid+" найдено. Проверь, что сообщения сообщества и Long Poll включены в VK.")
-        raise ValueError("Неизвестная платформа.")
+        token=setting("telegram_token")
+        if not token:raise ValueError("Telegram токен не задан.")
+        d=telegram_call(token,"getMe",{})
+        if not d.get("ok"):raise RuntimeError(d.get("description","Telegram API error"))
+        return jsonify(ok=True,message="Telegram API доступен: @"+d["result"].get("username",""))
     except Exception as e:
-        log.warning("bot test failed for %s: %s",platform,e)
+        log.warning("Telegram bot test failed: %s",e)
         return jsonify(ok=False,error=str(e)),400
 
 @app.route("/api/formats")
