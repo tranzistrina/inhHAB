@@ -740,21 +740,23 @@ def login():
 def logout():log.info("admin logout");session.clear();return redirect(url_for("login"))
 @app.route("/")
 def index():
-    bot_settings={"telegram_enabled":setting("telegram_enabled")=="1","telegram_token":setting("telegram_token") or "","bot_access_key":bot_access_key(),"public_base_url":setting("public_base_url") or os.getenv("PUBLIC_BASE_URL","")}
+    bot_settings={"telegram_enabled":setting("telegram_enabled")=="1","telegram_token":setting("telegram_token") or "","bot_access_key":bot_access_key(),"public_base_url":setting("public_base_url") or os.getenv("PUBLIC_BASE_URL",""),"telegram_api_url":setting("telegram_api_url") or os.getenv("TELEGRAM_API_URL","https://api.telegram.org"),"telegram_local_api":telegram_local_api_enabled()}
     with connect() as c:videos=c.execute("SELECT * FROM videos ORDER BY created_at DESC").fetchall();jobs=c.execute("SELECT * FROM jobs WHERE status IN ('queued','downloading','error') ORDER BY created_at DESC LIMIT 30").fetchall()
     return render_template_string(PAGE,page="index",videos=videos,jobs=jobs,bot_settings=bot_settings)
 @app.route("/api/bots",methods=["GET","POST"])
 @admin_only
 def api_bots():
     if request.method=="GET":
-        return jsonify(ok=True,telegram_enabled=setting("telegram_enabled")=="1",telegram_token_set=bool(setting("telegram_token")),bot_access_key=bot_access_key(),public_base_url=setting("public_base_url") or os.getenv("PUBLIC_BASE_URL",""))
+        return jsonify(ok=True,telegram_enabled=setting("telegram_enabled")=="1",telegram_token_set=bool(setting("telegram_token")),bot_access_key=bot_access_key(),public_base_url=setting("public_base_url") or os.getenv("PUBLIC_BASE_URL",""),telegram_api_url=telegram_api_base(),telegram_local_api=telegram_local_api_enabled())
     data=request.get_json(silent=True) or request.form
     if "telegram_enabled" in data:set_setting("telegram_enabled","1" if str(data.get("telegram_enabled")).lower() in {"1","true","on","yes"} else "0")
     if "telegram_token" in data and str(data.get("telegram_token","")).strip():set_setting("telegram_token",str(data.get("telegram_token")).strip())
     if "public_base_url" in data:set_setting("public_base_url",str(data.get("public_base_url","")).strip().rstrip("/"))
+    if "telegram_api_url" in data:set_setting("telegram_api_url",str(data.get("telegram_api_url","")).strip().rstrip("/"))
+    if "telegram_local_api" in data:set_setting("telegram_local_api","1" if str(data.get("telegram_local_api")).lower() in {"1","true","on","yes"} else "0")
     if "bot_access_key" in data and str(data.get("bot_access_key","")).strip():set_setting("bot_access_key",str(data.get("bot_access_key","")).strip())
     if str(data.get("rotate_access_key","")).lower() in {"1","true","yes"}:set_setting("bot_access_key",secrets.token_urlsafe(18))
-    return jsonify(ok=True,bot_access_key=bot_access_key(),public_base_url=setting("public_base_url") or os.getenv("PUBLIC_BASE_URL",""))
+    return jsonify(ok=True,bot_access_key=bot_access_key(),public_base_url=setting("public_base_url") or os.getenv("PUBLIC_BASE_URL",""),telegram_api_url=telegram_api_base(),telegram_local_api=telegram_local_api_enabled())
 
 @app.route("/api/bots/test",methods=["POST"])
 @admin_only
@@ -937,7 +939,7 @@ a{color:inherit;text-decoration:none}.mt{margin-top:18px}
 <div class="controls">
 <input id="url" placeholder="https://...">
 <select id="quality" disabled><option value="best">Сначала получите метаданные</option></select>
-<select id="container"><option value="mp4">MP4</option><option value="webm">WebM</option></select>
+<select id="container"><option value="mp4">MP4</option><option value="webm">WebM</option><option value="mp3_128">MP3 · 128 кбит/с</option><option value="mp3_320">MP3 · 320 кбит/с</option></select>
 <select id="ttl"><option value="12">12 часов</option><option value="24">24 часа</option><option value="72">3 дня</option><option value="168">7 дней</option><option value="720">30 дней</option><option value="never">Бессрочно</option></select>
 <button id="metaBtn" class="secondary" type="button" onclick="loadMetadata()">метаданные</button>
 <button id="downloadBtn" class="primary" type="button" onclick="startDownload()" disabled>скачать</button>
@@ -947,7 +949,7 @@ a{color:inherit;text-decoration:none}.mt{margin-top:18px}
 <div class="panel mt"><div class="row"><h2>Очередь</h2><a href="/logout">выйти</a></div><div id="jobs"></div></div>
 <div class="row mt"><h2>Видео на сервере</h2></div>
 <div class="grid">{% for v in videos %}<a class="card" href="/video/{{v["id"]}}">{% if v["thumbnail"] %}<img class="thumb" src="/thumb/{{v["id"]}}">{% else %}<div class="thumb"></div>{% endif %}<b>{{v["title"]}}</b><div class="muted">{{v["source"]}} · {{v["height"] or "?"}}p</div><button onclick="delv(event,'{{v["id"]}}')">удалить</button></a>{% else %}<div class="card muted">Видео пока нет.</div>{% endfor %}</div>
-<div class="panel mt"><h2>Telegram-бот</h2><p class="muted">После /access КЛЮЧ бот принимает ссылки, присылает готовое видео прямо в чат и показывает библиотеку через /videos.</p><div><label><input id="tgEnabled" type="checkbox" {% if bot_settings.telegram_enabled %}checked{% endif %}> включён</label><input id="tgToken" type="password" placeholder="{% if bot_settings.telegram_token %}токен сохранён, введите новый для замены{% else %}BotFather token{% endif %}" autocomplete="off"></div><div class="row mt"><div><b>Ключ доступа ботов</b><div class="muted">Его вводят пользователи командой /access КЛЮЧ.</div></div><input id="botKey" value="{{bot_settings.bot_access_key}}" style="flex:1" autocomplete="off"><button type="button" onclick="rotateBotKey()">новый ключ</button><button type="button" class="primary" onclick="saveBots()">сохранить</button></div><div class="row mt"><div><b>Публичный адрес</b><div class="muted">Не нужен для видео до 50 МБ: бот отправляет файл напрямую. Нужен как запасной вариант для более крупных файлов, чтобы Telegram мог забрать их по URL.</div></div><input id="publicBaseUrl" value="{{bot_settings.public_base_url}}" style="flex:1" placeholder="https://..."><button type="button" onclick="testBot()">проверить Telegram</button></div><div id="botStatus" class="muted mt"></div></div><div class="panel mt"><h2>Ручная загрузка</h2><form id="upload"><input name="file" type="file" accept="video/*" required><select name="ttl_hours"><option value="12">12 часов</option><option value="24">24 часа</option><option value="168">7 дней</option><option value="never">Бессрочно</option></select><button>загрузить</button></form></div>
+<div class="panel mt"><h2>Telegram-бот</h2><p class="muted">После /access КЛЮЧ бот принимает ссылки, присылает готовое видео прямо в чат и показывает библиотеку через /videos.</p><div><label><input id="tgEnabled" type="checkbox" {% if bot_settings.telegram_enabled %}checked{% endif %}> включён</label><input id="tgToken" type="password" placeholder="{% if bot_settings.telegram_token %}токен сохранён, введите новый для замены{% else %}BotFather token{% endif %}" autocomplete="off"></div><div class="row mt"><div><b>Ключ доступа ботов</b><div class="muted">Его вводят пользователи командой /access КЛЮЧ.</div></div><input id="botKey" value="{{bot_settings.bot_access_key}}" style="flex:1" autocomplete="off"><button type="button" onclick="rotateBotKey()">новый ключ</button><button type="button" class="primary" onclick="saveBots()">сохранить</button></div><div class="row mt"><div><b>Публичный адрес</b><div class="muted">Не нужен для файлов в пределах лимита Telegram. Нужен как запасной вариант, если прямой API не принимает файл.</div></div><input id="publicBaseUrl" value="{{bot_settings.public_base_url}}" style="flex:1" placeholder="https://..."><button type="button" onclick="testBot()">проверить Telegram</button></div><div class="row mt"><div><b>Telegram Bot API</b><div class="muted">Обычный API: 50 МБ. Локальный официальный Bot API Server: до 2000 МБ.</div></div><input id="telegramApiUrl" value="{{bot_settings.telegram_api_url}}" style="flex:1" placeholder="https://api.telegram.org"><label><input id="telegramLocalApi" type="checkbox" {% if bot_settings.telegram_local_api %}checked{% endif %}> локальный API</label></div><div id="botStatus" class="muted mt"></div></div><div class="panel mt"><h2>Ручная загрузка</h2><form id="upload"><input name="file" type="file" accept="video/*" required><select name="ttl_hours"><option value="12">12 часов</option><option value="24">24 часа</option><option value="168">7 дней</option><option value="never">Бессрочно</option></select><button>загрузить</button></form></div>
 <script>
 const q=s=>document.querySelector(s);
 const urlEl=q("#url"),qualityEl=q("#quality"),containerEl=q("#container"),ttlEl=q("#ttl"),metaBtn=q("#metaBtn"),downloadBtn=q("#downloadBtn"),preview=q("#preview"),jobsEl=q("#jobs");
@@ -960,6 +962,11 @@ function invalidateMetadata(){metadataUrl="";setMetaState(false);qualityEl.inner
 function sameMetadataUrl(){return metadataUrl===urlEl.value.trim()&&metadataUrl!==""}
 
 urlEl.addEventListener("input",()=>{if(metadataUrl!==urlEl.value.trim())invalidateMetadata()});
+containerEl.addEventListener("change",()=>{
+    const audio=containerEl.value.startsWith("mp3_");
+    qualityEl.disabled=audio||!metadataUrl;
+    if(audio)qualityEl.value="best";
+});
 
 async function apiFetch(url,options){
     const r=await fetch(url,options);
@@ -993,7 +1000,7 @@ async function startDownload(){
     if(!u||!sameMetadataUrl()){preview.className="error mt";preview.textContent="Сначала получите метаданные именно для текущего URL.";return}
     downloadBtn.disabled=true;
     try{
-        const d=await apiFetch("/api/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:u,metadata_url:metadataUrl,quality:qualityEl.value,container:containerEl.value,ttl_hours:ttlEl.value})});
+        const d=await apiFetch("/api/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:u,metadata_url:metadataUrl,quality:containerEl.value.startsWith("mp3_")?"best":qualityEl.value,container:containerEl.value,ttl_hours:ttlEl.value})});
         preview.className="success mt";preview.textContent="Добавлено в очередь. Скачивание выполняется в фоне.";
         poll();
     }catch(e){
@@ -1014,8 +1021,8 @@ async function poll(){
 }
 
 async function saveBots(){
- const d=await apiFetch("/api/bots",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({telegram_enabled:q("#tgEnabled").checked,telegram_token:q("#tgToken").value,bot_access_key:q("#botKey").value,public_base_url:q("#publicBaseUrl").value})});
- q("#botKey").value=d.bot_access_key;q("#tgToken").value="";q("#publicBaseUrl").value=d.public_base_url;q("#botStatus").textContent="Настройки Telegram сохранены.";
+ const d=await apiFetch("/api/bots",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({telegram_enabled:q("#tgEnabled").checked,telegram_token:q("#tgToken").value,bot_access_key:q("#botKey").value,public_base_url:q("#publicBaseUrl").value,telegram_api_url:q("#telegramApiUrl").value,telegram_local_api:q("#telegramLocalApi").checked})});
+ q("#botKey").value=d.bot_access_key;q("#tgToken").value="";q("#publicBaseUrl").value=d.public_base_url;q("#telegramApiUrl").value=d.telegram_api_url;q("#telegramLocalApi").checked=d.telegram_local_api;q("#botStatus").textContent="Настройки Telegram сохранены.";
 }
 async function testBot(){
  try{const d=await apiFetch("/api/bots/test",{method:"POST"});q("#botStatus").textContent=d.message}
