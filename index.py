@@ -6,6 +6,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -559,6 +560,47 @@ def find_result(folder):
     if not files:raise FileNotFoundError("yt-dlp не создал итоговый файл.")
     return max(files,key=lambda p:p.stat().st_mtime)
 
+def mime_for_path(path):
+    suffix=Path(path).suffix.lower()
+    return {"mp3":"audio/mpeg","mp4":"video/mp4","webm":"video/webm","m4a":"audio/mp4"}.get(suffix.lstrip("."),"application/octet-stream")
+
+def ffprobe_duration(path):
+    try:
+        p=subprocess.run(["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(path)],capture_output=True,text=True,timeout=30,check=True)
+        value=float((p.stdout or "").strip())
+        if value>0:return value
+    except Exception as e:
+        log.warning("ffprobe duration failed for %s: %s",path,e)
+    return None
+
+def split_video_for_telegram(path,folder,max_bytes=45*1024*1024):
+    path=Path(path)
+    if path.stat().st_size<=max_bytes:return [path]
+    duration=ffprobe_duration(path)
+    if not duration:raise RuntimeError("Для разбиения видео нужен ffprobe из комплекта ffmpeg.")
+    split_dir=Path(folder)/"telegram_parts";split_dir.mkdir(parents=True,exist_ok=True)
+    suffix=path.suffix.lower() or ".mp4"
+    parts=[];offset=0.0;part_no=1
+    while offset<duration-0.15:
+        remaining=duration-offset
+        source_size=path.stat().st_size
+        guess=max(1.0,remaining*min(0.88,max_bytes/max(source_size,1)))
+        out=split_dir/("part_%03d%s"%(part_no,suffix))
+        for _ in range(10):
+            out.unlink(missing_ok=True)
+            cmd=["ffmpeg","-hide_banner","-loglevel","error","-ss","%.3f"%offset,"-i",str(path),"-t","%.3f"%guess,"-map","0","-c","copy","-avoid_negative_ts","make_zero","-y",str(out)]
+            p=subprocess.run(cmd,capture_output=True,text=True,timeout=900)
+            if p.returncode!=0:raise RuntimeError((p.stderr or "ffmpeg не смог разделить видео.")[-1200:])
+            size=out.stat().st_size if out.exists() else 0
+            if size<=max_bytes or guess<=2.0:break
+            guess*=0.82
+        size=out.stat().st_size if out.exists() else 0
+        if not size or size>max_bytes:raise RuntimeError("Не удалось получить часть видео меньше 45 МБ.")
+        part_duration=ffprobe_duration(out)
+        if not part_duration or part_duration<=0:raise RuntimeError("Не удалось определить длительность части видео.")
+        parts.append(out);offset+=part_duration;part_no+=1
+    return parts
+
 def run_job(job_id):
     with connect() as c:
         job=c.execute("SELECT * FROM jobs WHERE id=?",(job_id,)).fetchone()
@@ -582,14 +624,25 @@ def run_job(job_id):
             notify_bot_progress(job_id,pct,eta,speed);last_progress_push=now_ts
     try:
         target_url=canonical_url(job["url"])
-        o=ydl_base();o.update({"format":fmt_for(job["quality"],job["container"]),"outtmpl":str(folder/"%(title).180s [%(id)s].%(ext)s"),"progress_hooks":[hook],"merge_output_format":job["container"]})
+        is_mp3=job["container"] in {"mp3_128","mp3_320"}
+        audio_bitrate=job["container"].split("_",1)[1] if is_mp3 else None
+        o=ydl_base()
+        o.update({"format":"bestaudio/best" if is_mp3 else fmt_for(job["quality"],job["container"]),"outtmpl":str(folder/"%(title).180s [%(id)s].%(ext)s"),"progress_hooks":[hook]})
+        if is_mp3:
+            o["postprocessors"]=[{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":audio_bitrate}]
+        else:
+            o["merge_output_format"]=job["container"]
         try:
             with yt_dlp.YoutubeDL(o) as ydl:
                 info=ydl.extract_info(target_url,download=True)
         except yt_dlp.utils.DownloadError as e:
             if source_name(job["url"])=="YouTube" and "page needs to be reloaded" in str(e).lower():
                 log.warning("YouTube download retry with player_client=default,web_embedded: %s",target_url)
-                o=ydl_base();o.update(youtube_fallback_options());o.update({"format":fmt_for(job["quality"],job["container"]),"outtmpl":str(folder/"%(title).180s [%(id)s].%(ext)s"),"progress_hooks":[hook],"merge_output_format":job["container"]})
+                o=ydl_base();o.update(youtube_fallback_options());o.update({"format":"bestaudio/best" if is_mp3 else fmt_for(job["quality"],job["container"]),"outtmpl":str(folder/"%(title).180s [%(id)s].%(ext)s"),"progress_hooks":[hook]})
+                if is_mp3:
+                    o["postprocessors"]=[{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":audio_bitrate}]
+                else:
+                    o["merge_output_format"]=job["container"]
                 with yt_dlp.YoutubeDL(o) as ydl:
                     info=ydl.extract_info(target_url,download=True)
             else:
@@ -601,7 +654,7 @@ def run_job(job_id):
             except Exception:pass
         with connect() as c:
             bot_owner=c.execute("SELECT platform,user_id,chat_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
-            c.execute("INSERT INTO videos(id,title,source_url,source,filename,mime_type,filesize,duration,width,height,uploader,thumbnail,created_at,expires_at,bot_platform,bot_user_id,bot_chat_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(vid,(info.get("title") or final.stem).strip(),job["url"],source_name(job["url"]),final.name,"video/"+final.suffix.lstrip("."),final.stat().st_size,info.get("duration"),info.get("width"),info.get("height"),info.get("uploader") or info.get("channel"),thumb,iso(now()),expires(job["ttl_hours"]),bot_owner["platform"] if bot_owner else None,bot_owner["user_id"] if bot_owner else None,bot_owner["chat_id"] if bot_owner else None))
+            c.execute("INSERT INTO videos(id,title,source_url,source,filename,mime_type,filesize,duration,width,height,uploader,thumbnail,created_at,expires_at,bot_platform,bot_user_id,bot_chat_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(vid,(info.get("title") or final.stem).strip(),job["url"],source_name(job["url"]),final.name,mime_for_path(final),final.stat().st_size,info.get("duration"),info.get("width"),info.get("height"),info.get("uploader") or info.get("channel"),thumb,iso(now()),expires(job["ttl_hours"]),bot_owner["platform"] if bot_owner else None,bot_owner["user_id"] if bot_owner else None,bot_owner["chat_id"] if bot_owner else None))
             c.execute("UPDATE jobs SET status='done',progress=100,title=?,video_id=?,finished_at=? WHERE id=?",(info.get("title") or final.stem,vid,iso(now()),job_id))
         notify_bot_video(job_id,vid,(info.get("title") or final.stem).strip())
         log.info("job %s completed: %s",job_id,info.get("title") or final.stem)
