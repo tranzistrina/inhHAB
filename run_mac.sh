@@ -2,28 +2,28 @@
 set -eu
 cd "$(dirname "$0")"
 
+# Optional: ./run_mac.sh --setup-code 'your-own-code'
+if [ "${1:-}" = "--setup-code" ]; then
+  if [ -z "${2:-}" ]; then
+    echo "Usage: ./run_mac.sh [--setup-code YOUR_CODE]" >&2
+    exit 2
+  fi
+  export ADMIN_SETUP_CODE="$2"
+  shift 2
+fi
+
+if [ "$#" -gt 0 ]; then
+  echo "Unknown argument: $1" >&2
+  echo "Usage: ./run_mac.sh [--setup-code YOUR_CODE]" >&2
+  exit 2
+fi
+
 if [ ! -d .venv ]; then python3 -m venv .venv; fi
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
-# Можно задать код настройки первым аргументом:
-#   ./run_mac.sh MySetupCode
-# Либо:
-#   ADMIN_SETUP_CODE=MySetupCode ./run_mac.sh
-#
-# Если код не задан, приложение сгенерирует его и запишет в лог при первом запуске.
-SETUP_CODE="${ADMIN_SETUP_CODE:-${1:-}}"
-
-if [ -n "$SETUP_CODE" ]; then
-  export ADMIN_SETUP_CODE="$SETUP_CODE"
-  echo "[inhHAB] Используется заданный ADMIN_SETUP_CODE."
-else
-  echo "[inhHAB] ADMIN_SETUP_CODE не задан. При первом запуске код будет сгенерирован и показан в консоли."
-fi
-
+# Also allow PORT/HOST overrides through environment variables.
 export PORT="${PORT:-1616}"
 export HOST="${HOST:-127.0.0.1}"
-export WAITRESS_THREADS="${WAITRESS_THREADS:-8}"
-
-exec python index.py
+exec python -u index.py
