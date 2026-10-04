@@ -211,9 +211,11 @@ def bot_create_job(platform,user_id,chat_id=None):
 def tg_quality_keyboard(options):
     rows=[];row=[]
     for q in options:
-        row.append({"text":str(q)+"p","callback_data":"q:"+str(q)})
+        label="Максимум" if str(q)=="best" else str(q)+"p"
+        row.append({"text":label,"callback_data":"q:"+str(q)})
         if len(row)==3:rows.append(row);row=[]
     if row:rows.append(row)
+    rows.append([{"text":"🎵 MP3 128 кбит/с","callback_data":"q:mp3_128"},{"text":"🎵 MP3 320 кбит/с","callback_data":"q:mp3_320"}])
     return rows
 
 def tg_container_keyboard():
@@ -221,6 +223,9 @@ def tg_container_keyboard():
 
 def tg_ttl_keyboard():
     return [[{"text":"12 часов","callback_data":"t:12"},{"text":"24 часа","callback_data":"t:24"}],[{"text":"3 дня","callback_data":"t:72"},{"text":"7 дней","callback_data":"t:168"}],[{"text":"30 дней","callback_data":"t:720"},{"text":"Бессрочно","callback_data":"t:never"}]]
+
+def tg_delivery_keyboard():
+    return [[{"text":"📦 Одним файлом","callback_data":"d:0"}],[{"text":"✂️ Частями по 45 МБ","callback_data":"d:45"}]]
 
 def bot_start_download(platform,user_id,chat_id,url,reply):
     try:
@@ -324,7 +329,12 @@ def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
         action=str(payload.get("cmd") or payload.get("inhhab") or "")
         value=str(payload.get("value",""))
         if action=="q":
-            save_bot_session(platform,user_id,quality=value);reply("Качество: "+value+"p\n\nТеперь выбери формат:",tg_container_keyboard());return
+            if value in {"mp3_128","mp3_320"}:
+                bitrate=value.split("_",1)[1]
+                save_bot_session(platform,user_id,quality="best",container=value,split_size_mb=0)
+                reply("Формат: MP3 "+bitrate+" кбит/с\n\nТеперь выбери срок хранения:",tg_ttl_keyboard())
+                return
+            save_bot_session(platform,user_id,quality=value);reply("Качество: "+("лучшее" if value=="best" else value+"p")+"\n\nТеперь выбери формат:",tg_container_keyboard());return
         if action=="c":
             if value not in {"mp4","webm"}:reply("Некорректный формат.");return
             save_bot_session(platform,user_id,container=value);reply("Формат: "+value.upper()+"\n\nТеперь выбери срок хранения:",tg_ttl_keyboard());return
@@ -332,7 +342,19 @@ def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
             if value not in {"12","24","72","168","720","never"}:reply("Некорректный срок хранения.");return
             save_bot_session(platform,user_id,ttl_hours=ttl_value(value))
             s=bot_session(platform,user_id);q=s["quality"] or "best";container=s["container"] or "mp4";label="бессрочно" if s["ttl_hours"] is None else str(s["ttl_hours"])+" ч."
-            reply("Готово к загрузке.\n\nКачество: "+("лучшее" if q=="best" else q+"p")+"\nФормат: "+container.upper()+"\nХранение: "+label,[[{"text":"⬇️ Скачать","callback_data":"go:1"}]]);return
+            if container.startswith("mp3_"):
+                bitrate=container.split("_",1)[1]
+                reply("Готово к загрузке.\n\nФормат: MP3 "+bitrate+" кбит/с\nХранение: "+label,[[{"text":"⬇️ Скачать","callback_data":"go:1"}]])
+            else:
+                reply("Готово. Как отправить готовое видео в Telegram?\n\nКачество: "+("лучшее" if q=="best" else q+"p")+"\nФормат: "+container.upper()+"\nХранение: "+label,tg_delivery_keyboard())
+            return
+        if action=="d":
+            if value not in {"0","45"}:reply("Некорректный режим отправки.");return
+            save_bot_session(platform,user_id,split_size_mb=int(value))
+            s=bot_session(platform,user_id);q=s["quality"] or "best";container=s["container"] or "mp4";label="бессрочно" if s["ttl_hours"] is None else str(s["ttl_hours"])+" ч."
+            mode="частями по 45 МБ" if value=="45" else "одним файлом"
+            reply("Готово к загрузке.\n\nКачество: "+("лучшее" if q=="best" else q+"p")+"\nФормат: "+container.upper()+"\nХранение: "+label+"\nОтправка: "+mode,[[{"text":"⬇️ Скачать","callback_data":"go:1"}]])
+            return
         if action=="go":
             try:
                 jid=bot_create_job(platform,user_id,chat_id)
@@ -701,8 +723,8 @@ def api_download():
         if metadata_url != url:
             raise ValueError("Сначала загрузите метаданные для этого URL.")
         ttl=ttl_value(str(data.get("ttl_hours","12")))
-        if container not in {"mp4","webm"}:
-            raise ValueError("Неподдерживаемый контейнер.")
+        if container not in {"mp4","webm","mp3_128","mp3_320"}:
+            raise ValueError("Неподдерживаемый формат.")
         if q!="best" and not (1<=int(q)<=4320):
             raise ValueError("Некорректное разрешение.")
         jid=uuid.uuid4().hex
