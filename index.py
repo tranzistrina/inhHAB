@@ -151,6 +151,24 @@ def format_speed(value):
     while s>=1024 and i<len(units)-1:s/=1024.0;i+=1
     return "%.1f %s"%(s,units[i])
 
+def bot_signature(kind,vid,expires_at):
+    raw="%s:%s:%s"%(kind,vid,expires_at)
+    return hmac.new(secret_value().encode("utf-8"),raw.encode("utf-8"),hashlib.sha256).hexdigest()
+
+def bot_signed_url(base,kind,vid,ttl=3600):
+    expires_at=int(time.time())+int(ttl)
+    sig=bot_signature(kind,vid,expires_at)
+    return base+"/bot/"+kind+"/"+vid+"?expires=%d&sig=%s"%(expires_at,sig)
+
+def bot_signature_valid(kind,vid,expires_at,sig):
+    try:
+        exp=int(expires_at)
+    except (TypeError,ValueError):
+        return False
+    if exp<int(time.time()):return False
+    expected=bot_signature(kind,vid,exp)
+    return bool(sig) and hmac.compare_digest(str(sig),expected)
+
 def bot_session(platform,user_id):
     with connect() as c:r=c.execute("SELECT * FROM bot_sessions WHERE platform=? AND user_id=?",(platform,str(user_id))).fetchone()
     return r
@@ -238,21 +256,26 @@ def bot_send_video(token,chat_id,vid,user_id=None):
         return False,"Видео %.1f МБ. Telegram Bot API сейчас не принимает прямую отправку видео ботом больше 50 МБ."%(size/1024/1024)
     import http.client
     boundary="----inhHAB_%s"%uuid.uuid4().hex
-    fields=[("chat_id",str(chat_id)),("caption",str(v["title"])[:1024]),("supports_streaming","true")]
-    if v["duration"] is not None:fields.append(("duration",str(int(v["duration"]))))
-    if v["width"] is not None:fields.append(("width",str(int(v["width"]))))
-    if v["height"] is not None:fields.append(("height",str(int(v["height"]))))
+    send_video=path.suffix.lower()==".mp4"
+    method="sendVideo" if send_video else "sendDocument"
+    field_name="video" if send_video else "document"
+    fields=[("chat_id",str(chat_id)),("caption",str(v["title"])[:1024])]
+    if send_video:
+        fields.append(("supports_streaming","true"))
+        if v["duration"] is not None:fields.append(("duration",str(int(v["duration"]))))
+        if v["width"] is not None:fields.append(("width",str(int(v["width"]))))
+        if v["height"] is not None:fields.append(("height",str(int(v["height"]))))
     chunks=[]
     for name,value in fields:
         chunks.append(("--"+boundary+"\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"%(name,value)).encode("utf-8"))
     mime=v["mime_type"] or "application/octet-stream"
-    file_head=("--"+boundary+"\r\nContent-Disposition: form-data; name=\"video\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n"%(path.name,mime)).encode("utf-8")
+    file_head=("--"+boundary+"\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n"%(field_name,path.name,mime)).encode("utf-8")
     file_tail=("\r\n--"+boundary+"--\r\n").encode("utf-8")
     content_length=sum(len(x) for x in chunks)+len(file_head)+size+len(file_tail)
     conn=None
     try:
         conn=http.client.HTTPSConnection("api.telegram.org",timeout=300)
-        conn.putrequest("POST","/bot%s/sendVideo"%token)
+        conn.putrequest("POST","/bot%s/%s"%(token,method))
         conn.putheader("Content-Type","multipart/form-data; boundary=%s"%boundary)
         conn.putheader("Content-Length",str(content_length))
         conn.putheader("User-Agent","inhHAB/1.0")
@@ -313,7 +336,7 @@ def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
             if sent:return
             base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
             if base:
-                reply("Видео готово. Открой просмотр:",[[{"text":"▶️ Смотреть","url":base+"/video/"+value},{"text":"⬇️ Скачать","url":base+"/download/"+value}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+                reply("Видео готово. Открой просмотр:",[[{"text":"▶️ Смотреть","url":bot_signed_url(base,"media",value,3600)},{"text":"⬇️ Скачать","url":bot_signed_url(base,"download",value,3600)}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
             else:
                 reply("Не удалось отправить видео прямо в Telegram.\n\n"+(reason or "Причина не указана.")+"\n\nДля файлов больше лимита Telegram можно указать PUBLIC_BASE_URL и открыть видео по ссылке.")
             return
@@ -356,7 +379,7 @@ def notify_bot_video(job_id,vid,title):
         else:
             base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
             if base:
-                telegram_send(token,chat_id,"Готово: "+title+"\n\nОткрой просмотр:",[[{"text":"▶️ Смотреть","url":base+"/video/"+vid},{"text":"⬇️ Скачать","url":base+"/download/"+vid}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+                telegram_send(token,chat_id,"Готово: "+title+"\n\nОткрой просмотр:",[[{"text":"▶️ Смотреть","url":bot_signed_url(base,"media",vid,86400)},{"text":"⬇️ Скачать","url":bot_signed_url(base,"download",vid,86400)}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
             else:
                 telegram_send(token,chat_id,"Видео скачано, но Telegram не принял прямую отправку.\n\n"+(reason or "Причина не указана.")+"\n\nДля файлов, которые больше лимита Telegram, укажи PUBLIC_BASE_URL.",[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
     except Exception as e:log.warning("bot video notification failed: %s",e)
@@ -416,7 +439,7 @@ def auth_gate():
         log.info("%s %s from %s",request.method,request.path,request.remote_addr)
     wants_json=request.path.startswith("/api/")
     if configured():
-        if not is_admin() and request.endpoint not in {"login","setup","static"}:
+        if not is_admin() and request.endpoint not in {"login","setup","static","bot_media_public","bot_download_public"}:
             if wants_json:
                 return jsonify(ok=False,error="Требуется вход администратора."),401
             return redirect(url_for("login",next=request.full_path))
@@ -723,6 +746,24 @@ def api_upload():
             path.unlink(missing_ok=True)
         log.exception("local upload failed")
         return jsonify(ok=False,error=str(e)),400
+@app.route("/bot/media/<vid>")
+def bot_media_public(vid):
+    if not bot_signature_valid("media",vid,request.args.get("expires"),request.args.get("sig")):abort(403)
+    with connect() as c:v=c.execute("SELECT filename FROM videos WHERE id=?",(vid,)).fetchone()
+    if not v:abort(404)
+    p=MEDIA/v["filename"]
+    if not p.is_file():abort(404)
+    return send_file(p,conditional=True)
+
+@app.route("/bot/download/<vid>")
+def bot_download_public(vid):
+    if not bot_signature_valid("download",vid,request.args.get("expires"),request.args.get("sig")):abort(403)
+    with connect() as c:v=c.execute("SELECT filename,title FROM videos WHERE id=?",(vid,)).fetchone()
+    if not v:abort(404)
+    p=MEDIA/v["filename"]
+    if not p.is_file():abort(404)
+    return send_file(p,as_attachment=True,download_name=secure_filename(v["title"])+p.suffix)
+
 @app.route("/video/<vid>")
 def video_page(vid):
     with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=?",(vid,)).fetchone()
