@@ -83,10 +83,18 @@ def admin_only(view):
 
 @app.before_request
 def auth_gate():
-    if request.endpoint!="static":log.info("%s %s from %s",request.method,request.path,request.remote_addr)
+    if request.endpoint!="static":
+        log.info("%s %s from %s",request.method,request.path,request.remote_addr)
+    wants_json=request.path.startswith("/api/")
     if configured():
-        if not is_admin() and request.endpoint not in {"login","setup","static"}:return redirect(url_for("login",next=request.full_path))
-    elif request.endpoint not in {"setup","static"}:return redirect(url_for("setup"))
+        if not is_admin() and request.endpoint not in {"login","setup","static"}:
+            if wants_json:
+                return jsonify(ok=False,error="Требуется вход администратора."),401
+            return redirect(url_for("login",next=request.full_path))
+    elif request.endpoint not in {"setup","static"}:
+        if wants_json:
+            return jsonify(ok=False,error="Сначала завершите первичную настройку."),403
+        return redirect(url_for("setup"))
 
 def ttl_value(raw):
     if raw in (None,"","never"):return None
@@ -205,23 +213,58 @@ def index():
     with connect() as c:videos=c.execute("SELECT * FROM videos ORDER BY created_at DESC").fetchall();jobs=c.execute("SELECT * FROM jobs WHERE status IN ('queued','downloading','error') ORDER BY created_at DESC LIMIT 30").fetchall()
     return render_template_string(PAGE,page="index",videos=videos,jobs=jobs)
 @app.route("/api/formats")
+@admin_only
 def api_formats():
     try:
-        url=request.args.get("url","").strip();src=validate_url(url);info=info_for(url);hs=qualities(info)
-        log.info("formats resolved: %s",url)
-        return jsonify(ok=True,source=src,title=info.get("title"),thumbnail=info.get("thumbnail"),qualities=[{"value":str(h),"label":"до %sp"%h} for h in hs]+[{"value":"best","label":"максимум"}])
-    except Exception as e:log.warning("format lookup failed: %s",e);return jsonify(ok=False,error=str(e)),400
+        url=request.args.get("url","").strip()
+        src=validate_url(url)
+        info=info_for(url)
+        hs=qualities(info)
+        qlist=[{"value":str(h),"label":"до %sp"%h} for h in hs]
+        qlist.append({"value":"best","label":"Максимум доступного"})
+        metadata={
+            "title":info.get("title") or "Без названия",
+            "thumbnail":info.get("thumbnail"),
+            "uploader":info.get("uploader") or info.get("channel"),
+            "duration":info.get("duration"),
+            "width":info.get("width"),
+            "height":info.get("height"),
+            "webpage_url":info.get("webpage_url") or url,
+            "formats_count":len(info.get("formats") or []),
+        }
+        log.info("metadata resolved: source=%s title=%r url=%s",src,metadata["title"],url)
+        return jsonify(ok=True,source=src,qualities=qlist,metadata=metadata)
+    except Exception as e:
+        log.warning("metadata lookup failed: %s",e)
+        return jsonify(ok=False,error=str(e)),400
 @app.route("/api/download",methods=["POST"])
+@admin_only
 def api_download():
-    data=request.get_json(silent=True) or request.form;url=str(data.get("url","")).strip();q=str(data.get("quality","best"));container=str(data.get("container","mp4")).lower()
+    data=request.get_json(silent=True) or request.form
+    url=str(data.get("url","")).strip()
+    q=str(data.get("quality","best"))
+    container=str(data.get("container","mp4")).lower()
+    metadata_url=str(data.get("metadata_url","")).strip()
     try:
-        validate_url(url);ttl=ttl_value(str(data.get("ttl_hours","12")))
-        if container not in {"mp4","webm"}:raise ValueError("Неподдерживаемый контейнер.")
-        if q!="best" and not (1<=int(q)<=4320):raise ValueError("Некорректное разрешение.")
+        validate_url(url)
+        if metadata_url != url:
+            raise ValueError("Сначала загрузите метаданные для этого URL.")
+        ttl=ttl_value(str(data.get("ttl_hours","12")))
+        if container not in {"mp4","webm"}:
+            raise ValueError("Неподдерживаемый контейнер.")
+        if q!="best" and not (1<=int(q)<=4320):
+            raise ValueError("Некорректное разрешение.")
         jid=uuid.uuid4().hex
-        with connect() as c:c.execute("INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,'queued',?)",(jid,url,q,container,ttl,iso(now())))
-        log.info("queued job %s: %s quality=%s container=%s ttl=%s",jid,url,q,container,ttl or "never");return jsonify(ok=True,job_id=jid)
-    except Exception as e:return jsonify(ok=False,error=str(e)),400
+        with connect() as c:
+            c.execute(
+                "INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,'queued',?)",
+                (jid,url,q,container,ttl,iso(now()))
+            )
+        log.info("queued job %s: %s quality=%s container=%s ttl=%s",jid,url,q,container,ttl or "never")
+        return jsonify(ok=True,job_id=jid)
+    except Exception as e:
+        log.warning("download request rejected: %s",e)
+        return jsonify(ok=False,error=str(e)),400
 @app.route("/api/jobs")
 def api_jobs():
     with connect() as c:rows=c.execute("SELECT id,url,quality,container,status,progress,title,error,video_id,created_at,finished_at FROM jobs ORDER BY created_at DESC LIMIT 50").fetchall()
@@ -240,11 +283,31 @@ def api_delete(vid):
 @admin_only
 def api_upload():
     f=request.files.get("file")
-    if not f or not f.filename:return jsonify(ok=False,error="Файл не выбран."),400
-    if Path(secure_filename(f.filename)).suffix.lower() not in {".mp4",".webm",".mkv",".mov",".avi"}:return jsonify(ok=False,error="Разрешены только видеофайлы."),400
-    ttl=ttl_value(request.form.get("ttl_hours","12"));vid=uuid.uuid4().hex;suffix=Path(secure_filename(f.filename)).suffix.lower();name=vid+suffix;path=MEDIA/name;f.save(path);log.info("uploaded local video %s (%s)",f.filename,path.stat().st_size)
-    with connect() as c:c.execute("INSERT INTO videos(id,title,source_url,source,filename,mime_type,filesize,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",(vid,Path(f.filename).stem,"local-upload","Local",name,"video/"+suffix.lstrip("."),path.stat().st_size,iso(now()),expires(ttl)))
-    return jsonify(ok=True,video_id=vid)
+    if not f or not f.filename:
+        return jsonify(ok=False,error="Файл не выбран."),400
+    safe_name=secure_filename(f.filename)
+    suffix=Path(safe_name).suffix.lower()
+    if suffix not in {".mp4",".webm",".mkv",".mov",".avi"}:
+        return jsonify(ok=False,error="Разрешены только видеофайлы: MP4, WebM, MKV, MOV, AVI."),400
+    try:
+        ttl=ttl_value(request.form.get("ttl_hours","12"))
+        vid=uuid.uuid4().hex
+        name=vid+suffix
+        path=MEDIA/name
+        f.save(path)
+        size=path.stat().st_size
+        with connect() as c:
+            c.execute(
+                "INSERT INTO videos(id,title,source_url,source,filename,mime_type,filesize,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (vid,Path(f.filename).stem,"local-upload","Local",name,"video/"+suffix.lstrip("."),size,iso(now()),expires(ttl))
+            )
+        log.info("uploaded local video %s (%s bytes)",f.filename,size)
+        return jsonify(ok=True,video_id=vid)
+    except Exception as e:
+        if 'path' in locals():
+            path.unlink(missing_ok=True)
+        log.exception("local upload failed")
+        return jsonify(ok=False,error=str(e)),400
 @app.route("/video/<vid>")
 def video_page(vid):
     with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=?",(vid,)).fetchone()
@@ -272,14 +335,125 @@ def thumb(vid):
     if not p.is_file():abort(404)
     return send_file(p,mimetype="image/jpeg",conditional=True)
 
-PAGE = r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>inhHAB</title><style>body{margin:0;background:#0b0d10;color:#eef2f5;font:15px system-ui}.wrap{max-width:1200px;margin:auto;padding:28px}input,select,button{padding:10px;border-radius:9px;background:#11161b;color:#fff;border:1px solid #29323b}.panel,.card{background:#12161b;border:1px solid #29323b;border-radius:15px;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}.thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:#080a0c;border-radius:10px}.muted{color:#97a1ab;font-size:13px}.row{display:flex;justify-content:space-between;gap:10px;align-items:center}.controls{display:grid;grid-template-columns:2fr 1fr 1fr 1fr auto;gap:10px}.primary{background:#79e3b0;color:#08100c;font-weight:800}.error{color:#ff9898}.progress{height:7px;background:#20262d;border-radius:8px;overflow:hidden}.progress i{display:block;height:100%;background:#79e3b0}a{color:inherit;text-decoration:none}.mt{margin-top:18px}@media(max-width:850px){.controls{grid-template-columns:1fr 1fr}.controls input:first-child{grid-column:1/-1}}</style></head><body><div class="wrap"><div class="row"><b>inhHAB</b><span class="muted">127.0.0.1:1616</span></div>
+PAGE = r'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>inhHAB</title><style>
+body{margin:0;background:#0b0d10;color:#eef2f5;font:15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:1200px;margin:auto;padding:28px}
+input,select,button{padding:10px;border-radius:9px;background:#11161b;color:#fff;border:1px solid #29323b}
+button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}
+.panel,.card{background:#12161b;border:1px solid #29323b;border-radius:15px;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:#080a0c;border-radius:10px}
+.meta-thumb{width:220px;max-width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:10px;background:#080a0c}
+.muted{color:#97a1ab;font-size:13px}.row{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.controls{display:grid;grid-template-columns:minmax(250px,2fr) 1fr 1fr 1fr auto auto;gap:10px}
+.primary{background:#79e3b0;color:#08100c;font-weight:800}.secondary{background:#20262d;color:#fff;font-weight:700}
+.error{color:#ff9898}.success{color:#9de6b8}
+.progress{height:7px;background:#20262d;border-radius:8px;overflow:hidden}.progress i{display:block;height:100%;background:#79e3b0}
+a{color:inherit;text-decoration:none}.mt{margin-top:18px}
+.metadata{display:grid;grid-template-columns:220px 1fr;gap:16px;align-items:start}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px}
+@media(max-width:1000px){.controls{grid-template-columns:1fr 1fr 1fr}.controls input:first-child{grid-column:1/-1}}
+@media(max-width:650px){.metadata{grid-template-columns:1fr}.controls{grid-template-columns:1fr}}
+</style></head><body><div class="wrap"><div class="row"><b>inhHAB</b><span class="muted">127.0.0.1:1616</span></div>
 {% if page=="setup" %}<div class="panel" style="max-width:520px;margin:80px auto"><h1>Первичная настройка</h1><p class="muted">Код можно задать через ADMIN_SETUP_CODE при запуске.</p>{% if error %}<p class="error">{{error}}</p>{% endif %}<form method="post"><input name="setup_code" placeholder="Код настройки" required><input name="password" type="password" placeholder="Пароль" minlength="8" required><input name="password2" type="password" placeholder="Повтор" minlength="8" required><button class="primary">Создать администратора</button></form></div>
 {% elif page=="login" %}<div class="panel" style="max-width:420px;margin:80px auto"><h1>Вход</h1>{% if error %}<p class="error">{{error}}</p>{% endif %}<form method="post"><input type="hidden" name="next" value="{{next_url}}"><input name="password" type="password" placeholder="Пароль" required><button class="primary">Войти</button></form></div>
 {% elif page=="video" %}<a href="/">← назад</a><div class="panel mt"><h1>{{video["title"]}}</h1><video controls style="width:100%;max-height:75vh" src="/media/{{video["id"]}}"></video><div class="row mt"><span class="muted">{{video["source"]}} · {{video["height"] or "?"}}p</span><a href="/download/{{video["id"]}}">скачать</a></div></div>
-{% else %}<div class="panel mt"><h1>Скачать видео</h1><div class="controls"><input id="url" placeholder="https://..."><select id="quality"><option value="best">Максимум</option></select><select id="container"><option value="mp4">MP4</option><option value="webm">WebM</option></select><select id="ttl"><option value="12">12 часов</option><option value="24">24 часа</option><option value="72">3 дня</option><option value="168">7 дней</option><option value="720">30 дней</option><option value="never">Бессрочно</option></select><button class="primary" onclick="startDownload()">скачать</button></div><div id="preview" class="muted mt">Вставь URL.</div></div>
-<div class="panel mt"><div class="row"><h2>Очередь</h2><a href="/logout">выйти</a></div><div id="jobs"></div></div><div class="row mt"><h2>Видео на сервере</h2></div><div class="grid">{% for v in videos %}<a class="card" href="/video/{{v["id"]}}">{% if v["thumbnail"] %}<img class="thumb" src="/thumb/{{v["id"]}}">{% else %}<div class="thumb"></div>{% endif %}<b>{{v["title"]}}</b><div class="muted">{{v["source"]}} · {{v["height"] or "?"}}p</div><button onclick="delv(event,'{{v["id"]}}')">удалить</button></a>{% else %}<div class="card muted">Видео пока нет.</div>{% endfor %}</div>
+{% else %}<div class="panel mt"><h1>Скачать видео</h1>
+<div class="controls">
+<input id="url" placeholder="https://...">
+<select id="quality" disabled><option value="best">Сначала получите метаданные</option></select>
+<select id="container"><option value="mp4">MP4</option><option value="webm">WebM</option></select>
+<select id="ttl"><option value="12">12 часов</option><option value="24">24 часа</option><option value="72">3 дня</option><option value="168">7 дней</option><option value="720">30 дней</option><option value="never">Бессрочно</option></select>
+<button id="metaBtn" class="secondary" type="button" onclick="loadMetadata()">метаданные</button>
+<button id="downloadBtn" class="primary" type="button" onclick="startDownload()" disabled>скачать</button>
+</div>
+<div id="preview" class="muted mt">Вставь URL и отдельно нажми «метаданные», затем выбери качество и скачай видео.</div>
+</div>
+<div class="panel mt"><div class="row"><h2>Очередь</h2><a href="/logout">выйти</a></div><div id="jobs"></div></div>
+<div class="row mt"><h2>Видео на сервере</h2></div>
+<div class="grid">{% for v in videos %}<a class="card" href="/video/{{v["id"]}}">{% if v["thumbnail"] %}<img class="thumb" src="/thumb/{{v["id"]}}">{% else %}<div class="thumb"></div>{% endif %}<b>{{v["title"]}}</b><div class="muted">{{v["source"]}} · {{v["height"] or "?"}}p</div><button onclick="delv(event,'{{v["id"]}}')">удалить</button></a>{% else %}<div class="card muted">Видео пока нет.</div>{% endfor %}</div>
 <div class="panel mt"><h2>Ручная загрузка</h2><form id="upload"><input name="file" type="file" accept="video/*" required><select name="ttl_hours"><option value="12">12 часов</option><option value="24">24 часа</option><option value="168">7 дней</option><option value="never">Бессрочно</option></select><button>загрузить</button></form></div>
-<script>const q=s=>document.querySelector(s);let last="";q("#url").addEventListener("blur",formats);q("#url").addEventListener("change",formats);async function formats(){let u=q("#url").value.trim();if(!u||u===last)return;last=u;q("#preview").textContent="получаю форматы…";try{let d=await (await fetch("/api/formats?url="+encodeURIComponent(u))).json();if(!d.ok)throw Error(d.error);q("#quality").innerHTML=d.qualities.map(x=>'<option value="'+x.value+'">'+x.label+"</option>").join("");q("#preview").textContent=d.title||u}catch(e){q("#preview").textContent=e.message}}async function startDownload(){let d=await (await fetch("/api/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:q("#url").value.trim(),quality:q("#quality").value,container:q("#container").value,ttl_hours:q("#ttl").value})})).json();q("#preview").textContent=d.ok?"добавлено в очередь":d.error;poll()}async function poll(){let d=await (await fetch("/api/jobs")).json();q("#jobs").innerHTML=d.jobs.map(j=>'<div class="card mt"><div class="row"><b>'+esc(j.title||j.url)+'</b><span>'+j.status+"</span></div><div class="muted">"+esc(j.quality)+" · "+esc(j.container)+(j.error?" · "+esc(j.error):"")+'</div><div class="progress"><i style="width:'+j.progress+'%"></i></div></div>').join("")||'<span class="muted">очередь пуста</span>'}async function delv(e,id){e.preventDefault();e.stopPropagation();if(confirm("Удалить?")){await fetch("/api/videos/"+id,{method:"DELETE"});location.reload()}}q("#upload").addEventListener("submit",async e=>{e.preventDefault();let d=await (await fetch("/api/upload",{method:"POST",body:new FormData(e.target)})).json();if(!d.ok)alert(d.error);else location.reload()});function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]))}poll();setInterval(poll,2000)</script>{% endif %}</div></body></html>'''
+<script>
+const q=s=>document.querySelector(s);
+const urlEl=q("#url"),qualityEl=q("#quality"),containerEl=q("#container"),ttlEl=q("#ttl"),metaBtn=q("#metaBtn"),downloadBtn=q("#downloadBtn"),preview=q("#preview"),jobsEl=q("#jobs");
+let metadataUrl="";
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]))}
+function durationText(sec){if(!Number.isFinite(Number(sec)))return "—";let n=Math.max(0,Math.round(Number(sec))),h=Math.floor(n/3600),m=Math.floor((n%3600)/60),s=n%60;return h?String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0"):String(m).padStart(2,"0")+":"+String(s).padStart(2,"0")}
+function setMetaState(ready){downloadBtn.disabled=!ready;qualityEl.disabled=!ready}
+function invalidateMetadata(){metadataUrl="";setMetaState(false);qualityEl.innerHTML='<option value="best">Сначала получите метаданные</option>';preview.className="muted mt";preview.textContent="URL изменён. Снова получите метаданные перед скачиванием."}
+function sameMetadataUrl(){return metadataUrl===urlEl.value.trim()&&metadataUrl!==""}
+
+urlEl.addEventListener("input",()=>{if(metadataUrl!==urlEl.value.trim())invalidateMetadata()});
+
+async function apiFetch(url,options){
+    const r=await fetch(url,options);
+    const text=await r.text();
+    let d={};
+    try{d=JSON.parse(text)}catch(e){throw Error("Сервер вернул неожиданный ответ ("+r.status+").")}
+    if(!r.ok||d.ok===false)throw Error(d.error||("HTTP "+r.status));
+    return d;
+}
+
+async function loadMetadata(){
+    const u=urlEl.value.trim();
+    if(!u){invalidateMetadata();preview.className="error mt";preview.textContent="Сначала вставь URL.";return}
+    metaBtn.disabled=true;downloadBtn.disabled=true;qualityEl.disabled=true;
+    preview.className="muted mt";preview.textContent="получаю метаданные…";
+    try{
+        const d=await apiFetch("/api/formats?url="+encodeURIComponent(u));
+        qualityEl.innerHTML=d.qualities.map(x=>'<option value="'+esc(x.value)+'">'+esc(x.label)+'</option>').join("");
+        const m=d.metadata||{};
+        const thumb=m.thumbnail?'<img class="meta-thumb" src="'+esc(m.thumbnail)+'" alt="thumbnail">':'<div class="meta-thumb"></div>';
+        preview.className="mt";
+        preview.innerHTML='<div class="metadata">'+thumb+'<div><h3 style="margin-top:0">'+esc(m.title||u)+'</h3><div class="kv"><span class="muted">Источник</span><span>'+esc(d.source)+'</span><span class="muted">Автор</span><span>'+esc(m.uploader||"—")+'</span><span class="muted">Длительность</span><span>'+durationText(m.duration)+'</span><span class="muted">Разрешение</span><span>'+esc((m.width&&m.height)?m.width+"×"+m.height:"—")+'</span><span class="muted">Форматов</span><span>'+esc(m.formats_count||0)+'</span></div></div></div>';
+        metadataUrl=u;setMetaState(true);
+    }catch(e){
+        metadataUrl="";setMetaState(false);preview.className="error mt";preview.textContent=e.message;
+    }finally{metaBtn.disabled=false}
+}
+
+async function startDownload(){
+    const u=urlEl.value.trim();
+    if(!u||!sameMetadataUrl()){preview.className="error mt";preview.textContent="Сначала получите метаданные именно для текущего URL.";return}
+    downloadBtn.disabled=true;
+    try{
+        const d=await apiFetch("/api/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:u,metadata_url:metadataUrl,quality:qualityEl.value,container:containerEl.value,ttl_hours:ttlEl.value})});
+        preview.className="success mt";preview.textContent="Добавлено в очередь. Скачивание выполняется в фоне.";
+        poll();
+    }catch(e){
+        preview.className="error mt";preview.textContent=e.message;
+    }finally{downloadBtn.disabled=false}
+}
+
+function jobStatus(s){return ({queued:"в очереди",downloading:"скачивается",done:"готово",error:"ошибка"})[s]||s}
+async function poll(){
+    try{
+        const d=await apiFetch("/api/jobs");
+        jobsEl.innerHTML=d.jobs.map(j=>{
+            const err=j.error?'<div class="error">'+esc(j.error)+'</div>':"";
+            const link=j.video_id?'<div class="mt"><a href="/video/'+encodeURIComponent(j.video_id)+'">открыть видео</a></div>':"";
+            return '<div class="card mt"><div class="row"><b>'+esc(j.title||j.url)+'</b><span>'+esc(jobStatus(j.status))+'</span></div><div class="muted">'+esc(j.quality)+" · "+esc(j.container)+" · "+esc(j.progress)+"%"+(j.error?" · ошибка":"")+'</div><div class="progress"><i style="width:'+Math.max(0,Math.min(100,Number(j.progress)||0))+'%"></i></div>'+err+link+'</div>';
+        }).join("")||'<span class="muted">очередь пуста</span>';
+    }catch(e){jobsEl.innerHTML='<div class="error">'+esc(e.message)+'</div>'}
+}
+
+async function delv(e,id){
+    e.preventDefault();e.stopPropagation();
+    if(!confirm("Удалить видео с сервера?"))return;
+    try{await apiFetch("/api/videos/"+encodeURIComponent(id),{method:"DELETE"});location.reload()}catch(err){alert(err.message)}
+}
+
+q("#upload").addEventListener("submit",async e=>{
+    e.preventDefault();
+    const btn=e.target.querySelector("button");btn.disabled=true;
+    try{await apiFetch("/api/upload",{method:"POST",body:new FormData(e.target)});location.reload()}
+    catch(err){alert(err.message);btn.disabled=false}
+});
+
+poll();setInterval(poll,2000);
+</script>{% endif %}</div></body></html>'''
+
 
 if __name__=="__main__":
     host=os.getenv("HOST","127.0.0.1");port=int(os.getenv("PORT","1616"));threads=int(os.getenv("WAITRESS_THREADS","8"))
