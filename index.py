@@ -47,8 +47,13 @@ def setup_code():
     v=secrets.token_urlsafe(20); SETUP.write_text(v,encoding="utf-8")
     try: SETUP.chmod(0o600)
     except OSError: pass
-    log.info("First-run setup code: %s",v)
+    log.warning("First-run setup code: %s",v)
     return v
+
+# Generate/show the setup code at startup, not after the user has already submitted the form.
+# An explicit ADMIN_SETUP_CODE always takes precedence.
+if not os.getenv("ADMIN_SETUP_CODE"):
+    setup_code()
 
 app=Flask(__name__); app.secret_key=secret_value()
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE","0")=="1",MAX_CONTENT_LENGTH=int(os.getenv("MAX_UPLOAD_BYTES",str(20*1024**3))))
