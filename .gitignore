@@ -1,0 +1,9 @@
+__pycache__/
+.venv/
+*.pyc
+data/media/*
+data/thumbs/*
+data/tmp/*
+data/inhhab.db
+data/.session_secret
+data/.setup_code
