@@ -116,6 +116,15 @@ def vk_api(token,method,payload):
     data=urllib.parse.urlencode(p).encode("utf-8")
     req=urllib.request.Request("https://api.vk.com/method/"+method,data=data,headers={"Content-Type":"application/x-www-form-urlencoded","User-Agent":"inhHAB/1.0"})
     with urllib.request.urlopen(req,timeout=35) as r:return json.loads(r.read().decode("utf-8"))
+def vk_group_id_from_token(token):
+    d=vk_api(token,"groups.getById",{})
+    if "error" in d:raise RuntimeError("VK groups.getById: "+str(d["error"]))
+    groups=(d.get("response") or {}).get("groups") or []
+    if not groups:raise RuntimeError("VK API не вернул сообщество для этого токена.")
+    gid=str(groups[0].get("id") or "")
+    if not gid:raise RuntimeError("VK API не вернул ID сообщества.")
+    return gid
+
 def vk_send(token,peer_id,text,keyboard=None):
     p={"peer_id":peer_id,"random_id":0,"message":text}
     if keyboard:p["keyboard"]=json.dumps({"one_time":False,"inline":True,"buttons":keyboard},ensure_ascii=False)
@@ -278,12 +287,7 @@ def vk_loop():
         if not token or not bot_enabled("vk"):time.sleep(3);continue
         try:
             if not server:
-                g=vk_api(token,"groups.getById",{})
-                if "error" in g:raise RuntimeError(str(g["error"]))
-                groups=(g.get("response") or {}).get("groups") or []
-                if not groups:raise RuntimeError("VK token не привязан к сообществу.")
-                group_id=str(groups[0].get("id") or "")
-                if not group_id:raise RuntimeError("VK API не вернул ID сообщества.")
+                group_id=vk_group_id_from_token(token)
                 d=vk_api(token,"groups.getLongPollServer",{"group_id":group_id})
                 if "error" in d:raise RuntimeError(str(d["error"]))
                 server=d["response"]["server"];key=d["response"]["key"];ts=d["response"]["ts"]
@@ -507,6 +511,30 @@ def api_bots():
     if str(data.get("rotate_access_key","")).lower() in {"1","true","yes"}:set_setting("bot_access_key",secrets.token_urlsafe(18))
     log.info("bot settings updated")
     return jsonify(ok=True,bot_access_key=bot_access_key())
+@app.route("/api/bots/test",methods=["POST"])
+@admin_only
+def api_bots_test():
+    data=request.get_json(silent=True) or request.form
+    platform=str(data.get("platform","")).lower()
+    try:
+        if platform=="telegram":
+            token=setting("telegram_token")
+            if not token:raise ValueError("Telegram токен не задан.")
+            d=telegram_call(token,"getMe",{})
+            if not d.get("ok"):raise RuntimeError(d.get("description","Telegram API error"))
+            return jsonify(ok=True,message="Telegram API доступен: @"+d["result"].get("username",""))
+        if platform=="vk":
+            token=setting("vk_token")
+            if not token:raise ValueError("VK токен не задан.")
+            gid=vk_group_id_from_token(token)
+            d=vk_api(token,"groups.getLongPollServer",{"group_id":gid})
+            if "error" in d:raise RuntimeError(str(d["error"]))
+            return jsonify(ok=True,message="VK API доступен, сообщество #"+gid+" найдено. Проверь, что сообщения сообщества и Long Poll включены в VK.")
+        raise ValueError("Неизвестная платформа.")
+    except Exception as e:
+        log.warning("bot test failed for %s: %s",platform,e)
+        return jsonify(ok=False,error=str(e)),400
+
 @app.route("/api/formats")
 @admin_only
 def api_formats():
