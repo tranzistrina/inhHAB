@@ -27,6 +27,16 @@ find_python() {
       fi
     fi
   done
+  if command -v brew >/dev/null 2>&1; then
+    for version in 3.13 3.12 3.11; do
+      prefix="$(brew --prefix "python@${version}" 2>/dev/null || true)"
+      candidate="$prefix/bin/python${version}"
+      if [ -x "$candidate" ] && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+        echo "$candidate"
+        return 0
+      fi
+    done
+  fi
   return 1
 }
 
