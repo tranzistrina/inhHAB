@@ -438,12 +438,16 @@ def notify_bot_video(job_id,vid,title):
         for idx,part in enumerate(parts,1):
             part_title=title if len(parts)==1 else "%s · часть %d/%d"%(title,idx,len(parts))
             sent,reason=telegram_send_local_file(token,chat_id,part,part_title,v["duration"],v["width"],v["height"],v["uploader"])
+            if sent and len(parts)>1 and r["progress_message_id"]:
+                telegram_edit(token,chat_id,r["progress_message_id"],"📤 Отправка частей: %d/%d"%(idx,len(parts)))
             if not sent:
                 base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
                 if base and len(parts)==1:
                     telegram_send(token,chat_id,"Файл не удалось отправить напрямую. Открой по ссылке:",[[{"text":"▶️ Смотреть","url":bot_signed_url(base,"media",vid,86400)},{"text":"⬇️ Скачать","url":bot_signed_url(base,"download",vid,86400)}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
                     return
                 raise RuntimeError(reason or "Telegram не принял файл.")
+            if idx<len(parts):
+                time.sleep(1.05)
         telegram_send(token,chat_id,"Готово: "+title+"\n\n"+("Все части отправлены." if len(parts)>1 else "Файл отправлен прямо сюда."),[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
     except Exception as e:
         log.warning("bot video notification failed: %s",e)
@@ -619,7 +623,7 @@ def split_video_for_telegram(path,folder,max_bytes=45*1024*1024):
         out=split_dir/("part_%03d%s"%(part_no,suffix))
         for _ in range(10):
             out.unlink(missing_ok=True)
-            cmd=["ffmpeg","-hide_banner","-loglevel","error","-ss","%.3f"%offset,"-i",str(path),"-t","%.3f"%guess,"-map","0","-c","copy","-avoid_negative_ts","make_zero","-y",str(out)]
+            cmd=["ffmpeg","-hide_banner","-loglevel","error","-ss","%.3f"%offset,"-i",str(path),"-t","%.3f"%guess,"-map","0:v:0","-map","0:a?","-c","copy","-avoid_negative_ts","make_zero","-y",str(out)]
             p=subprocess.run(cmd,capture_output=True,text=True,timeout=900)
             if p.returncode!=0:raise RuntimeError((p.stderr or "ffmpeg не смог разделить видео.")[-1200:])
             size=out.stat().st_size if out.exists() else 0
@@ -934,7 +938,7 @@ a{color:inherit;text-decoration:none}.mt{margin-top:18px}
 </style></head><body><div class="wrap"><div class="row"><b>inhHAB</b><span class="muted">127.0.0.1:1616</span></div>
 {% if page=="setup" %}<div class="panel" style="max-width:520px;margin:80px auto"><h1>Первичная настройка</h1><p class="muted">Код можно задать через ADMIN_SETUP_CODE при запуске.</p>{% if error %}<p class="error">{{error}}</p>{% endif %}<form method="post"><input name="setup_code" placeholder="Код настройки" required><input name="password" type="password" placeholder="Пароль" minlength="8" required><input name="password2" type="password" placeholder="Повтор" minlength="8" required><button class="primary">Создать администратора</button></form></div>
 {% elif page=="login" %}<div class="panel" style="max-width:420px;margin:80px auto"><h1>Вход</h1>{% if error %}<p class="error">{{error}}</p>{% endif %}<form method="post"><input type="hidden" name="next" value="{{next_url}}"><input name="password" type="password" placeholder="Пароль" required><button class="primary">Войти</button></form></div>
-{% elif page=="video" %}<a href="/">← назад</a><div class="panel mt"><h1>{{video["title"]}}</h1><video controls style="width:100%;max-height:75vh" src="/media/{{video["id"]}}"></video><div class="row mt"><span class="muted">{{video["source"]}} · {{video["height"] or "?"}}p</span><a href="/download/{{video["id"]}}">скачать</a></div></div>
+{% elif page=="video" %}<a href="/">← назад</a><div class="panel mt"><h1>{{video["title"]}}</h1>{% if video["mime_type"].startswith("audio/") %}<audio controls style="width:100%" src="/media/{{video["id"]}}"></audio>{% else %}<video controls style="width:100%;max-height:75vh" src="/media/{{video["id"]}}"></video>{% endif %}<div class="row mt"><span class="muted">{{video["source"]}} · {% if video["mime_type"].startswith("audio/") %}MP3{% else %}{{video["height"] or "?"}}p{% endif %}</span><a href="/download/{{video["id"]}}">скачать</a></div></div>
 {% else %}<div class="panel mt"><h1>Скачать видео</h1>
 <div class="controls">
 <input id="url" placeholder="https://...">
@@ -957,7 +961,7 @@ let metadataUrl="";
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]))}
 function durationText(sec){if(!Number.isFinite(Number(sec)))return "—";let n=Math.max(0,Math.round(Number(sec))),h=Math.floor(n/3600),m=Math.floor((n%3600)/60),s=n%60;return h?String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0"):String(m).padStart(2,"0")+":"+String(s).padStart(2,"0")}
-function setMetaState(ready){downloadBtn.disabled=!ready;qualityEl.disabled=!ready}
+function setMetaState(ready){downloadBtn.disabled=!ready;qualityEl.disabled=!ready||containerEl.value.startsWith("mp3_")}
 function invalidateMetadata(){metadataUrl="";setMetaState(false);qualityEl.innerHTML='<option value="best">Сначала получите метаданные</option>';preview.className="muted mt";preview.textContent="URL изменён. Снова получите метаданные перед скачиванием."}
 function sameMetadataUrl(){return metadataUrl===urlEl.value.trim()&&metadataUrl!==""}
 
