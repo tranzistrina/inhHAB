@@ -82,10 +82,6 @@ with connect() as c:
     except sqlite3.OperationalError:pass
     try:c.execute("ALTER TABLE videos ADD COLUMN bot_chat_id TEXT")
     except sqlite3.OperationalError:pass
-    c.execute("DELETE FROM settings WHERE key IN ('vk_enabled','vk_token','vk_group_id')")
-    c.execute("DELETE FROM bot_users WHERE platform='vk'")
-    c.execute("DELETE FROM bot_sessions WHERE platform='vk'")
-    c.execute("DELETE FROM bot_requests WHERE platform='vk'")
 
 def setting(k):
     with connect() as c:r=c.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone()
