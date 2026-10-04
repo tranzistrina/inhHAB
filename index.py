@@ -71,12 +71,16 @@ with connect() as c:
     CREATE INDEX IF NOT EXISTS idx_videos_expires ON videos(expires_at);
     CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,created_at);
     CREATE TABLE IF NOT EXISTS bot_users(platform TEXT NOT NULL,user_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
-    CREATE TABLE IF NOT EXISTS bot_requests(job_id TEXT PRIMARY KEY,platform TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT,progress_message_id INTEGER);
-    CREATE TABLE IF NOT EXISTS bot_sessions(platform TEXT NOT NULL,user_id TEXT NOT NULL,url TEXT NOT NULL,title TEXT,quality TEXT,container TEXT,ttl_hours INTEGER,qualities_json TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
+    CREATE TABLE IF NOT EXISTS bot_requests(job_id TEXT PRIMARY KEY,platform TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT,progress_message_id INTEGER,split_size_mb INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS bot_sessions(platform TEXT NOT NULL,user_id TEXT NOT NULL,url TEXT NOT NULL,title TEXT,quality TEXT,container TEXT,ttl_hours INTEGER,qualities_json TEXT,split_size_mb INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
     """)
     try:c.execute("ALTER TABLE bot_requests ADD COLUMN chat_id TEXT")
     except sqlite3.OperationalError:pass
     try:c.execute("ALTER TABLE bot_requests ADD COLUMN progress_message_id INTEGER")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE bot_requests ADD COLUMN split_size_mb INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE bot_sessions ADD COLUMN split_size_mb INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:pass
     try:c.execute("ALTER TABLE videos ADD COLUMN bot_platform TEXT")
     except sqlite3.OperationalError:pass
@@ -98,6 +102,15 @@ def bot_access_key():
 
 def bot_enabled(platform):return setting(platform+"_enabled")=="1"
 
+def telegram_api_base():
+    return (os.getenv("TELEGRAM_API_URL") or setting("telegram_api_url") or "https://api.telegram.org").strip().rstrip("/")
+
+def telegram_local_api_enabled():
+    return (os.getenv("TELEGRAM_LOCAL_API") or setting("telegram_local_api") or "0").strip().lower() in {"1","true","yes","on"}
+
+def telegram_upload_limit_bytes():
+    return (2000*1024*1024) if telegram_local_api_enabled() else (50*1024*1024)
+
 def http_json(url,payload=None,timeout=35):
     data=json.dumps(payload or {}).encode("utf-8")
     req=urllib.request.Request(url,data=data,headers={"Content-Type":"application/json","User-Agent":"inhHAB/1.0"})
@@ -112,8 +125,8 @@ def bot_authorize(platform,user_id,key):
     with connect() as c:c.execute("INSERT OR IGNORE INTO bot_users(platform,user_id,created_at) VALUES(?,?,?)",(platform,str(user_id),iso(now())))
     return True
 
-def bot_register_request(job_id,platform,user_id,chat_id=None):
-    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_requests(job_id,platform,user_id,chat_id,progress_message_id) VALUES(?,?,?,?,NULL)",(job_id,platform,str(user_id),str(chat_id or user_id)))
+def bot_register_request(job_id,platform,user_id,chat_id=None,split_size_mb=0):
+    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_requests(job_id,platform,user_id,chat_id,progress_message_id,split_size_mb) VALUES(?,?,?,?,NULL,?)",(job_id,platform,str(user_id),str(chat_id or user_id),int(split_size_mb or 0)))
 
 def bot_set_progress_message(job_id,message_id):
     if not message_id:return
@@ -123,7 +136,7 @@ def bot_progress_message(job_id):
     with connect() as c:r=c.execute("SELECT platform,user_id,chat_id,progress_message_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
     return r
 
-def telegram_call(token,method,payload):return http_json("https://api.telegram.org/bot%s/%s"%(token,method),payload)
+def telegram_call(token,method,payload):return http_json(telegram_api_base()+"/bot%s/%s"%(token,method),payload)
 def telegram_send(token,chat_id,text,keyboard=None):
     p={"chat_id":chat_id,"text":text}
     if keyboard:p["reply_markup"]={"inline_keyboard":keyboard}
@@ -175,10 +188,10 @@ def bot_session(platform,user_id):
 
 def save_bot_session(platform,user_id,**kw):
     old=bot_session(platform,user_id)
-    vals={"url":"","title":"","quality":"","container":"","ttl_hours":None,"qualities_json":"[]"}
+    vals={"url":"","title":"","quality":"","container":"","ttl_hours":None,"qualities_json":"[]","split_size_mb":0}
     if old:vals.update(dict(old))
     vals.update(kw)
-    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_sessions(platform,user_id,url,title,quality,container,ttl_hours,qualities_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(platform,str(user_id),vals["url"],vals["title"],vals["quality"],vals["container"],vals["ttl_hours"],vals["qualities_json"],iso(now())))
+    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_sessions(platform,user_id,url,title,quality,container,ttl_hours,qualities_json,split_size_mb,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(platform,str(user_id),vals["url"],vals["title"],vals["quality"],vals["container"],vals["ttl_hours"],vals["qualities_json"],int(vals["split_size_mb"] or 0),iso(now())))
 
 def clear_bot_session(platform,user_id):
     with connect() as c:c.execute("DELETE FROM bot_sessions WHERE platform=? AND user_id=?",(platform,str(user_id)))
@@ -190,10 +203,10 @@ def bot_quality_options(info):
 def bot_create_job(platform,user_id,chat_id=None):
     s=bot_session(platform,user_id)
     if not s or not s["url"]:raise ValueError("Сессия выбора устарела. Отправь ссылку ещё раз.")
-    q=s["quality"] or "best";container=s["container"] or "mp4";ttl=s["ttl_hours"]
+    q=s["quality"] or "best";container=s["container"] or "mp4";ttl=s["ttl_hours"];split_size_mb=int(s["split_size_mb"] or 0)
     jid=uuid.uuid4().hex
     with connect() as c:c.execute("INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,'queued',?)",(jid,s["url"],q,container,ttl,iso(now())))
-    bot_register_request(jid,platform,user_id,chat_id);clear_bot_session(platform,user_id);return jid
+    bot_register_request(jid,platform,user_id,chat_id,split_size_mb);clear_bot_session(platform,user_id);return jid
 
 def tg_quality_keyboard(options):
     rows=[];row=[]
