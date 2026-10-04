@@ -150,11 +150,14 @@ def handle_bot_text(platform,chat_id,user_id,text,reply):
     reply("Неизвестная команда. /help")
 
 def telegram_loop():
-    offset=None
+    offset=None;ready_token=None
     while True:
         token=setting("telegram_token")
-        if not token or not bot_enabled("telegram"):time.sleep(3);continue
+        if not token or not bot_enabled("telegram"):ready_token=None;time.sleep(3);continue
         try:
+            if token!=ready_token:
+                telegram_call(token,"deleteWebhook",{})
+                ready_token=token
             payload={"timeout":25,"limit":50};payload.update({"offset":offset} if offset is not None else {})
             data=telegram_call(token,"getUpdates",payload)
             if not data.get("ok"):raise RuntimeError(data.get("description","Telegram API error"))
