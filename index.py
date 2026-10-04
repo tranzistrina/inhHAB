@@ -71,9 +71,17 @@ with connect() as c:
     CREATE INDEX IF NOT EXISTS idx_videos_expires ON videos(expires_at);
     CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,created_at);
     CREATE TABLE IF NOT EXISTS bot_users(platform TEXT NOT NULL,user_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
-    CREATE TABLE IF NOT EXISTS bot_requests(job_id TEXT PRIMARY KEY,platform TEXT NOT NULL,user_id TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS bot_requests(job_id TEXT PRIMARY KEY,platform TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT);
     CREATE TABLE IF NOT EXISTS bot_sessions(platform TEXT NOT NULL,user_id TEXT NOT NULL,url TEXT NOT NULL,title TEXT,quality TEXT,container TEXT,ttl_hours INTEGER,qualities_json TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
     """)
+    try:c.execute("ALTER TABLE bot_requests ADD COLUMN chat_id TEXT")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE videos ADD COLUMN bot_platform TEXT")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE videos ADD COLUMN bot_user_id TEXT")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE videos ADD COLUMN bot_chat_id TEXT")
+    except sqlite3.OperationalError:pass
 
 def setting(k):
     with connect() as c:r=c.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone()
@@ -102,8 +110,8 @@ def bot_authorize(platform,user_id,key):
     with connect() as c:c.execute("INSERT OR IGNORE INTO bot_users(platform,user_id,created_at) VALUES(?,?,?)",(platform,str(user_id),iso(now())))
     return True
 
-def bot_register_request(job_id,platform,user_id):
-    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_requests(job_id,platform,user_id) VALUES(?,?,?)",(job_id,platform,str(user_id)))
+def bot_register_request(job_id,platform,user_id,chat_id=None):
+    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_requests(job_id,platform,user_id,chat_id) VALUES(?,?,?,?)",(job_id,platform,str(user_id),str(chat_id or user_id)))
 
 def telegram_call(token,method,payload):return http_json("https://api.telegram.org/bot%s/%s"%(token,method),payload)
 def telegram_send(token,chat_id,text,keyboard=None):
@@ -148,13 +156,13 @@ def bot_quality_options(info):
     hs=qualities(info)
     return hs or ["best"]
 
-def bot_create_job(platform,user_id):
+def bot_create_job(platform,user_id,chat_id=None):
     s=bot_session(platform,user_id)
     if not s or not s["url"]:raise ValueError("Сессия выбора устарела. Отправь ссылку ещё раз.")
     q=s["quality"] or "best";container=s["container"] or "mp4";ttl=s["ttl_hours"]
     jid=uuid.uuid4().hex
     with connect() as c:c.execute("INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,'queued',?)",(jid,s["url"],q,container,ttl,iso(now())))
-    bot_register_request(jid,platform,user_id);clear_bot_session(platform,user_id);return jid
+    bot_register_request(jid,platform,user_id,chat_id);clear_bot_session(platform,user_id);return jid
 
 def tg_quality_keyboard(options):
     rows=[];row=[]
