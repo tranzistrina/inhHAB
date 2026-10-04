@@ -71,10 +71,12 @@ with connect() as c:
     CREATE INDEX IF NOT EXISTS idx_videos_expires ON videos(expires_at);
     CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,created_at);
     CREATE TABLE IF NOT EXISTS bot_users(platform TEXT NOT NULL,user_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
-    CREATE TABLE IF NOT EXISTS bot_requests(job_id TEXT PRIMARY KEY,platform TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT);
+    CREATE TABLE IF NOT EXISTS bot_requests(job_id TEXT PRIMARY KEY,platform TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT,progress_message_id INTEGER);
     CREATE TABLE IF NOT EXISTS bot_sessions(platform TEXT NOT NULL,user_id TEXT NOT NULL,url TEXT NOT NULL,title TEXT,quality TEXT,container TEXT,ttl_hours INTEGER,qualities_json TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
     """)
     try:c.execute("ALTER TABLE bot_requests ADD COLUMN chat_id TEXT")
+    except sqlite3.OperationalError:pass
+    try:c.execute("ALTER TABLE bot_requests ADD COLUMN progress_message_id INTEGER")
     except sqlite3.OperationalError:pass
     try:c.execute("ALTER TABLE videos ADD COLUMN bot_platform TEXT")
     except sqlite3.OperationalError:pass
@@ -111,13 +113,43 @@ def bot_authorize(platform,user_id,key):
     return True
 
 def bot_register_request(job_id,platform,user_id,chat_id=None):
-    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_requests(job_id,platform,user_id,chat_id) VALUES(?,?,?,?)",(job_id,platform,str(user_id),str(chat_id or user_id)))
+    with connect() as c:c.execute("INSERT OR REPLACE INTO bot_requests(job_id,platform,user_id,chat_id,progress_message_id) VALUES(?,?,?,?,NULL)",(job_id,platform,str(user_id),str(chat_id or user_id)))
+
+def bot_set_progress_message(job_id,message_id):
+    if not message_id:return
+    with connect() as c:c.execute("UPDATE bot_requests SET progress_message_id=? WHERE job_id=?",(int(message_id),job_id))
+
+def bot_progress_message(job_id):
+    with connect() as c:r=c.execute("SELECT platform,user_id,chat_id,progress_message_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
+    return r
 
 def telegram_call(token,method,payload):return http_json("https://api.telegram.org/bot%s/%s"%(token,method),payload)
 def telegram_send(token,chat_id,text,keyboard=None):
     p={"chat_id":chat_id,"text":text}
     if keyboard:p["reply_markup"]={"inline_keyboard":keyboard}
     return telegram_call(token,"sendMessage",p)
+
+def telegram_edit(token,chat_id,message_id,text,keyboard=None):
+    p={"chat_id":chat_id,"message_id":message_id,"text":text}
+    if keyboard:p["reply_markup"]={"inline_keyboard":keyboard}
+    try:return telegram_call(token,"editMessageText",p)
+    except Exception as e:
+        log.warning("Telegram progress edit failed: %s",e);return None
+
+def format_duration(seconds):
+    if seconds is None:return "неизвестно"
+    try:n=max(0,int(round(float(seconds))))
+    except (TypeError,ValueError):return "неизвестно"
+    h,n=divmod(n,3600);m,s=divmod(n,60)
+    return ("%02d:%02d:%02d"%(h,m,s)) if h else ("%02d:%02d"%(m,s))
+
+def format_speed(value):
+    try:s=float(value)
+    except (TypeError,ValueError):return ""
+    if s<=0:return ""
+    units=("B/s","KiB/s","MiB/s","GiB/s");i=0
+    while s>=1024 and i<len(units)-1:s/=1024.0;i+=1
+    return "%.1f %s"%(s,units[i])
 
 def bot_session(platform,user_id):
     with connect() as c:r=c.execute("SELECT * FROM bot_sessions WHERE platform=? AND user_id=?",(platform,str(user_id))).fetchone()
@@ -197,15 +229,56 @@ def telegram_library_keyboard(rows):
     return buttons
 
 def bot_send_video(token,chat_id,vid,user_id=None):
-    base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
-    if not base:return False
     with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=?",(vid,)).fetchone()
-    if not v or not (MEDIA/v["filename"]).is_file():return False
+    if not v:return False,"Видео не найдено."
+    path=MEDIA/v["filename"]
+    if not path.is_file():return False,"Файл видео отсутствует на диске."
+    size=path.stat().st_size
+    if size>50*1024*1024:
+        return False,"Видео %.1f МБ. Telegram Bot API сейчас не принимает прямую отправку видео ботом больше 50 МБ."%(size/1024/1024)
+    import http.client
+    boundary="----inhHAB_%s"%uuid.uuid4().hex
+    fields=[("chat_id",str(chat_id)),("caption",str(v["title"])[:1024]),("supports_streaming","true")]
+    if v["duration"] is not None:fields.append(("duration",str(int(v["duration"]))))
+    if v["width"] is not None:fields.append(("width",str(int(v["width"]))))
+    if v["height"] is not None:fields.append(("height",str(int(v["height"]))))
+    chunks=[]
+    for name,value in fields:
+        chunks.append(("--"+boundary+"\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"%(name,value)).encode("utf-8"))
+    mime=v["mime_type"] or "application/octet-stream"
+    file_head=("--"+boundary+"\r\nContent-Disposition: form-data; name=\"video\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n"%(path.name,mime)).encode("utf-8")
+    file_tail=("\r\n--"+boundary+"--\r\n").encode("utf-8")
+    content_length=sum(len(x) for x in chunks)+len(file_head)+size+len(file_tail)
+    conn=None
     try:
-        d=telegram_call(token,"sendVideo",{"chat_id":chat_id,"video":base+"/media/"+vid,"caption":v["title"][:1024],"supports_streaming":True})
-        return bool(d.get("ok"))
+        conn=http.client.HTTPSConnection("api.telegram.org",timeout=300)
+        conn.putrequest("POST","/bot%s/sendVideo"%token)
+        conn.putheader("Content-Type","multipart/form-data; boundary=%s"%boundary)
+        conn.putheader("Content-Length",str(content_length))
+        conn.putheader("User-Agent","inhHAB/1.0")
+        conn.endheaders()
+        for chunk in chunks:conn.send(chunk)
+        conn.send(file_head)
+        with path.open("rb") as f:
+            while True:
+                chunk=f.read(1024*1024)
+                if not chunk:break
+                conn.send(chunk)
+        conn.send(file_tail)
+        response=conn.getresponse()
+        raw=response.read().decode("utf-8","replace")
+        data=json.loads(raw)
+        if data.get("ok"):return True,""
+        reason=data.get("description","Telegram не принял видео.")
+        log.warning("Telegram direct video upload failed: %s",reason)
+        return False,reason
     except Exception as e:
-        log.warning("Telegram video send failed: %s",e);return False
+        log.warning("Telegram direct video upload failed: %s",e)
+        return False,str(e)
+    finally:
+        if conn:
+            try:conn.close()
+            except Exception:pass
 
 def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
     text=(text or "").strip();parts=text.split()
@@ -225,16 +298,24 @@ def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
             s=bot_session(platform,user_id);q=s["quality"] or "best";container=s["container"] or "mp4";label="бессрочно" if s["ttl_hours"] is None else str(s["ttl_hours"])+" ч."
             reply("Готово к загрузке.\n\nКачество: "+("лучшее" if q=="best" else q+"p")+"\nФормат: "+container.upper()+"\nХранение: "+label,[[{"text":"⬇️ Скачать","callback_data":"go:1"}]]);return
         if action=="go":
-            try:bot_create_job(platform,user_id,chat_id);reply("Задача добавлена.\n\nЯ сообщу, когда видео будет готово.")
+            try:
+                jid=bot_create_job(platform,user_id,chat_id)
+                sent=reply("📥 Скачивание запущено.\n\nПрогресс: 0%\nОстаток: рассчитывается…")
+                if isinstance(sent,dict):
+                    mid=(sent.get("result") or {}).get("message_id")
+                    if mid:bot_set_progress_message(jid,mid)
             except Exception as e:reply("Ошибка: "+str(e))
             return
         if action=="videos":
             rows=bot_video_rows(user_id);reply(bot_videos_text(rows),telegram_library_keyboard(rows));return
         if action=="view":
-            if bot_send_video(setting("telegram_token"),chat_id,value,user_id):return
+            sent,reason=bot_send_video(setting("telegram_token"),chat_id,value,user_id)
+            if sent:return
             base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
-            if base:reply("Видео готово. Открой просмотр:",[[{"text":"▶️ Смотреть","url":base+"/video/"+value},{"text":"⬇️ Скачать","url":base+"/download/"+value}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
-            else:reply("Для просмотра из чата нужен PUBLIC_BASE_URL, доступный Telegram.")
+            if base:
+                reply("Видео готово. Открой просмотр:",[[{"text":"▶️ Смотреть","url":base+"/video/"+value},{"text":"⬇️ Скачать","url":base+"/download/"+value}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+            else:
+                reply("Не удалось отправить видео прямо в Telegram.\n\n"+(reason or "Причина не указана.")+"\n\nДля файлов больше лимита Telegram можно указать PUBLIC_BASE_URL и открыть видео по ссылке.")
             return
     if not parts:return
     cmd=parts[0].split("@",1)[0].lower()
@@ -263,19 +344,34 @@ def notify_bot_request(job_id,text):
     except Exception as e:log.warning("bot notification failed: %s",e)
 
 def notify_bot_video(job_id,vid,title):
-    with connect() as c:r=c.execute("SELECT platform,user_id,chat_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
+    with connect() as c:r=c.execute("SELECT platform,user_id,chat_id,progress_message_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
     if not r or r["platform"]!="telegram" or not setting("telegram_token"):return
     chat_id=r["chat_id"] or r["user_id"];token=setting("telegram_token")
     try:
-        if bot_send_video(token,chat_id,vid,r["user_id"]):
+        if r["progress_message_id"]:
+            telegram_edit(token,chat_id,r["progress_message_id"],"✅ Скачивание завершено.\n\n📤 Отправляю видео в Telegram…")
+        sent,reason=bot_send_video(token,chat_id,vid,r["user_id"])
+        if sent:
             telegram_send(token,chat_id,"Готово: "+title+"\n\nВидео отправлено прямо сюда.",[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
         else:
             base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
             if base:
                 telegram_send(token,chat_id,"Готово: "+title+"\n\nОткрой просмотр:",[[{"text":"▶️ Смотреть","url":base+"/video/"+vid},{"text":"⬇️ Скачать","url":base+"/download/"+vid}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
             else:
-                telegram_send(token,chat_id,"Готово: "+title+"\n\nДля просмотра из Telegram настрой PUBLIC_BASE_URL.",[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+                telegram_send(token,chat_id,"Видео скачано, но Telegram не принял прямую отправку.\n\n"+(reason or "Причина не указана.")+"\n\nДля файлов, которые больше лимита Telegram, укажи PUBLIC_BASE_URL.",[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
     except Exception as e:log.warning("bot video notification failed: %s",e)
+
+def notify_bot_progress(job_id,pct,eta=None,speed=None):
+    r=bot_progress_message(job_id)
+    if not r or r["platform"]!="telegram" or not r["progress_message_id"] or not setting("telegram_token"):return
+    chat_id=r["chat_id"] or r["user_id"];token=setting("telegram_token")
+    bars=20;filled=max(0,min(bars,int(round((pct or 0)*bars/100.0))))
+    bar="█"*filled+"░"*(bars-filled)
+    text="📥 Скачивание…\n\n[%s] %.1f%%"%(bar,max(0.0,min(100.0,pct or 0)))
+    text+="\nОстаток: "+format_duration(eta)
+    sp=format_speed(speed)
+    if sp:text+="\nСкорость: "+sp
+    telegram_edit(token,chat_id,r["progress_message_id"],text)
 
 def telegram_loop():
     offset=None;ready_token=None
@@ -411,13 +507,21 @@ def run_job(job_id):
         if not job:return
         c.execute("UPDATE jobs SET status='downloading',started_at=? WHERE id=?",(iso(now()),job_id))
     log.info("job %s started: %s",job_id,job["url"]);folder=TMP/job_id;folder.mkdir(parents=True,exist_ok=True)
+    last_progress_push=0.0
     def hook(d):
-        pct=0.0
+        nonlocal last_progress_push
+        pct=0.0;eta=d.get("eta")
+        total=d.get("total_bytes") or d.get("total_bytes_estimate");got=d.get("downloaded_bytes")
+        speed=d.get("speed")
         if d.get("status")=="downloading":
-            total=d.get("total_bytes") or d.get("total_bytes_estimate");got=d.get("downloaded_bytes")
             if total and got:pct=min(99.0,got*100/total)
-        elif d.get("status")=="finished":pct=99.0
+            if eta is None and total and got and speed and speed>0:eta=max(0.0,(total-got)/speed)
+        elif d.get("status")=="finished":
+            pct=99.0;eta=0
         with connect() as c:c.execute("UPDATE jobs SET progress=? WHERE id=?",(pct,job_id))
+        now_ts=time.time()
+        if d.get("status")=="downloading" and now_ts-last_progress_push>=5.0:
+            notify_bot_progress(job_id,pct,eta,speed);last_progress_push=now_ts
     try:
         target_url=canonical_url(job["url"])
         o=ydl_base();o.update({"format":fmt_for(job["quality"],job["container"]),"outtmpl":str(folder/"%(title).180s [%(id)s].%(ext)s"),"progress_hooks":[hook],"merge_output_format":job["container"]})
