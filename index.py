@@ -104,23 +104,64 @@ def ttl_value(raw):
 def expires(ttl):return iso(now()+timedelta(hours=ttl)) if ttl else None
 def source_name(url):
     host=(urllib.parse.urlparse(url).hostname or "").lower()
-    if "youtube.com" in host or "youtu.be" in host:return "YouTube"
-    if "pornhub.com" in host:return "PornHub"
+    if host=="youtube.com" or host.endswith(".youtube.com") or host=="youtu.be" or host.endswith(".youtu.be"):return "YouTube"
+    if host=="pornhub.com" or host.endswith(".pornhub.com") or host=="pornhub.org" or host.endswith(".pornhub.org"):return "PornHub"
     return None
+
+def canonical_url(url):
+    p=urllib.parse.urlparse(url)
+    host=(p.hostname or "").lower()
+    # PornHub's rt.pornhub.org links point at the same view_video endpoint but
+    # are not matched by the PornHub extractor as reliably as the canonical .com host.
+    if host=="rt.pornhub.org" or host.endswith(".pornhub.org"):
+        return urllib.parse.urlunparse(("https","www.pornhub.com",p.path or "/",p.params,p.query,p.fragment))
+    return url
+
 def validate_url(url):
     p=urllib.parse.urlparse(url)
-    if p.scheme not in {"http","https"} or not p.netloc:raise ValueError("Нужен полноценный http(s) URL.")
+    if p.scheme not in {"http","https"} or not p.netloc:
+        raise ValueError("Нужен полноценный http(s) URL.")
     s=source_name(url)
-    if not s:raise ValueError("Поддерживаются только YouTube и PornHub.")
+    if not s:
+        raise ValueError("Поддерживаются только YouTube и PornHub.")
+    if s=="PornHub" and not urllib.parse.parse_qs(p.query).get("viewkey") and "/view_video.php" in p.path:
+        raise ValueError("У PornHub-ссылки не найден параметр viewkey.")
     return s
+
+def youtube_fallback_options():
+    return {"extractor_args":{"youtube":{"player_client":["default","web_embedded"]}}}
+
 def ydl_base():
     o={"quiet":True,"no_warnings":True,"noplaylist":True,"socket_timeout":int(os.getenv("YTDLP_SOCKET_TIMEOUT","30"))}
     if os.getenv("YTDLP_COOKIEFILE"):o["cookiefile"]=os.getenv("YTDLP_COOKIEFILE")
     if os.getenv("YTDLP_USER_AGENT"):o["http_headers"]={"User-Agent":os.getenv("YTDLP_USER_AGENT")}
+    # If Deno is installed, current yt-dlp enables it by default. If only Node
+    # is available, explicitly enable Node for the EJS JavaScript challenges.
+    if shutil.which("deno"):
+        log.info("yt-dlp JS runtime: deno")
+    elif shutil.which("node"):
+        o["js_runtimes"]={"node":{}}
+        log.info("yt-dlp JS runtime: node")
+    else:
+        log.warning("No supported yt-dlp JS runtime found (install Deno or Node for full YouTube support).")
     return o
+
+def is_youtube_reload_error(exc):
+    return source_name(str(getattr(exc,"url","")) or "")=="YouTube" and "page needs to be reloaded" in str(exc).lower()
+
 def info_for(url):
+    normalized=canonical_url(url)
     o=ydl_base();o["skip_download"]=True
-    with yt_dlp.YoutubeDL(o) as ydl:return ydl.extract_info(url,download=False)
+    try:
+        with yt_dlp.YoutubeDL(o) as ydl:
+            return ydl.extract_info(normalized,download=False)
+    except yt_dlp.utils.DownloadError as e:
+        if source_name(url)=="YouTube" and "page needs to be reloaded" in str(e).lower():
+            log.warning("YouTube extractor retry with player_client=default,web_embedded: %s",normalized)
+            o=ydl_base();o["skip_download"]=True;o.update(youtube_fallback_options())
+            with yt_dlp.YoutubeDL(o) as ydl:
+                return ydl.extract_info(normalized,download=False)
+        raise
 def qualities(info):
     hs=sorted({f.get("height") for f in (info.get("formats") or []) if isinstance(f.get("height"),int) and 0<f.get("height")<=4320})
     return sorted(set([x for x in (360,480,720,1080,1440,2160) if x in hs]+[x for x in hs if x not in (360,480,720,1080,1440,2160)]))
@@ -148,8 +189,19 @@ def run_job(job_id):
         elif d.get("status")=="finished":pct=99.0
         with connect() as c:c.execute("UPDATE jobs SET progress=? WHERE id=?",(pct,job_id))
     try:
+        target_url=canonical_url(job["url"])
         o=ydl_base();o.update({"format":fmt_for(job["quality"],job["container"]),"outtmpl":str(folder/"%(title).180s [%(id)s].%(ext)s"),"progress_hooks":[hook],"merge_output_format":job["container"]})
-        with yt_dlp.YoutubeDL(o) as ydl:info=ydl.extract_info(job["url"],download=True)
+        try:
+            with yt_dlp.YoutubeDL(o) as ydl:
+                info=ydl.extract_info(target_url,download=True)
+        except yt_dlp.utils.DownloadError as e:
+            if source_name(job["url"])=="YouTube" and "page needs to be reloaded" in str(e).lower():
+                log.warning("YouTube download retry with player_client=default,web_embedded: %s",target_url)
+                o=ydl_base();o.update(youtube_fallback_options());o.update({"format":fmt_for(job["quality"],job["container"]),"outtmpl":str(folder/"%(title).180s [%(id)s].%(ext)s"),"progress_hooks":[hook],"merge_output_format":job["container"]})
+                with yt_dlp.YoutubeDL(o) as ydl:
+                    info=ydl.extract_info(target_url,download=True)
+            else:
+                raise
         src=find_result(folder);vid=uuid.uuid4().hex;final=MEDIA/(vid+src.suffix.lower());shutil.move(str(src),str(final));thumb=None
         if info.get("thumbnail"):
             tp=THUMBS/(vid+".jpg")
@@ -229,7 +281,7 @@ def api_formats():
             "duration":info.get("duration"),
             "width":info.get("width"),
             "height":info.get("height"),
-            "webpage_url":info.get("webpage_url") or url,
+            "webpage_url":info.get("webpage_url") or canonical_url(url),
             "formats_count":len(info.get("formats") or []),
         }
         log.info("metadata resolved: source=%s title=%r url=%s",src,metadata["title"],url)
