@@ -69,6 +69,8 @@ with connect() as c:
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,url TEXT NOT NULL,quality TEXT NOT NULL,container TEXT NOT NULL,ttl_hours INTEGER,status TEXT NOT NULL,progress REAL NOT NULL DEFAULT 0,title TEXT,error TEXT,video_id TEXT,created_at TEXT NOT NULL,started_at TEXT,finished_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_videos_expires ON videos(expires_at);
     CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,created_at);
+    CREATE TABLE IF NOT EXISTS bot_users(platform TEXT NOT NULL,user_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(platform,user_id));
+    CREATE TABLE IF NOT EXISTS bot_requests(job_id TEXT PRIMARY KEY,platform TEXT NOT NULL,user_id TEXT NOT NULL);
     """)
 
 def setting(k):
@@ -263,8 +265,24 @@ def login():
 def logout():log.info("admin logout");session.clear();return redirect(url_for("login"))
 @app.route("/")
 def index():
+    bot_settings={"telegram_enabled":setting("telegram_enabled")=="1","telegram_token":setting("telegram_token") or "","vk_enabled":setting("vk_enabled")=="1","vk_token":setting("vk_token") or "","vk_group_id":setting("vk_group_id") or "","bot_access_key":bot_access_key()}
     with connect() as c:videos=c.execute("SELECT * FROM videos ORDER BY created_at DESC").fetchall();jobs=c.execute("SELECT * FROM jobs WHERE status IN ('queued','downloading','error') ORDER BY created_at DESC LIMIT 30").fetchall()
-    return render_template_string(PAGE,page="index",videos=videos,jobs=jobs)
+    return render_template_string(PAGE,page="index",videos=videos,jobs=jobs,bot_settings=bot_settings)
+@app.route("/api/bots",methods=["GET","POST"])
+@admin_only
+def api_bots():
+    if request.method=="GET":
+        return jsonify(ok=True,telegram_enabled=setting("telegram_enabled")=="1",telegram_token_set=bool(setting("telegram_token")),vk_enabled=setting("vk_enabled")=="1",vk_token_set=bool(setting("vk_token")),vk_group_id=setting("vk_group_id") or "",bot_access_key=bot_access_key())
+    data=request.get_json(silent=True) or request.form
+    if "telegram_enabled" in data:set_setting("telegram_enabled","1" if str(data.get("telegram_enabled")).lower() in {"1","true","on","yes"} else "0")
+    if "telegram_token" in data and str(data.get("telegram_token","")).strip():set_setting("telegram_token",str(data.get("telegram_token")).strip())
+    if "vk_enabled" in data:set_setting("vk_enabled","1" if str(data.get("vk_enabled")).lower() in {"1","true","on","yes"} else "0")
+    if "vk_token" in data and str(data.get("vk_token","")).strip():set_setting("vk_token",str(data.get("vk_token")).strip())
+    if "vk_group_id" in data:set_setting("vk_group_id",str(data.get("vk_group_id","")).strip())
+    if "bot_access_key" in data and str(data.get("bot_access_key","")).strip():set_setting("bot_access_key",str(data.get("bot_access_key")).strip())
+    if str(data.get("rotate_access_key","")).lower() in {"1","true","yes"}:set_setting("bot_access_key",secrets.token_urlsafe(18))
+    log.info("bot settings updated")
+    return jsonify(ok=True,bot_access_key=bot_access_key())
 @app.route("/api/formats")
 @admin_only
 def api_formats():
@@ -425,7 +443,7 @@ a{color:inherit;text-decoration:none}.mt{margin-top:18px}
 <div class="panel mt"><div class="row"><h2>Очередь</h2><a href="/logout">выйти</a></div><div id="jobs"></div></div>
 <div class="row mt"><h2>Видео на сервере</h2></div>
 <div class="grid">{% for v in videos %}<a class="card" href="/video/{{v["id"]}}">{% if v["thumbnail"] %}<img class="thumb" src="/thumb/{{v["id"]}}">{% else %}<div class="thumb"></div>{% endif %}<b>{{v["title"]}}</b><div class="muted">{{v["source"]}} · {{v["height"] or "?"}}p</div><button onclick="delv(event,'{{v["id"]}}')">удалить</button></a>{% else %}<div class="card muted">Видео пока нет.</div>{% endfor %}</div>
-<div class="panel mt"><h2>Ручная загрузка</h2><form id="upload"><input name="file" type="file" accept="video/*" required><select name="ttl_hours"><option value="12">12 часов</option><option value="24">24 часа</option><option value="168">7 дней</option><option value="never">Бессрочно</option></select><button>загрузить</button></form></div>
+<div class="panel mt"><h2>Боты Telegram / VK</h2><p class="muted">Пользователь сначала отправляет боту <b>/access КЛЮЧ</b>, после чего получает доступ к /download и /status.</p><div class="grid"><div><h3>Telegram</h3><label><input id="tgEnabled" type="checkbox" {% if bot_settings.telegram_enabled %}checked{% endif %}> включён</label><input id="tgToken" type="password" placeholder="{% if bot_settings.telegram_token %}токен сохранён, введите новый для замены{% else %}BotFather token{% endif %}" autocomplete="off"></div><div><h3>VK</h3><label><input id="vkEnabled" type="checkbox" {% if bot_settings.vk_enabled %}checked{% endif %}> включён</label><input id="vkToken" type="password" placeholder="{% if bot_settings.vk_token %}токен сохранён, введите новый для замены{% else %}токен сообщества{% endif %}"><input id="vkGroup" value="{{bot_settings.vk_group_id}}" placeholder="ID сообщества"></div></div><div class="row mt"><div><b>Ключ доступа ботов</b><div class="muted">Его вводят пользователи командой /access КЛЮЧ.</div></div><input id="botKey" value="{{bot_settings.bot_access_key}}" style="flex:1" autocomplete="off"><button type="button" onclick="rotateBotKey()">новый ключ</button><button type="button" class="primary" onclick="saveBots()">сохранить</button></div><div id="botStatus" class="muted mt"></div></div><div class="panel mt"><h2>Ручная загрузка</h2><form id="upload"><input name="file" type="file" accept="video/*" required><select name="ttl_hours"><option value="12">12 часов</option><option value="24">24 часа</option><option value="168">7 дней</option><option value="never">Бессрочно</option></select><button>загрузить</button></form></div>
 <script>
 const q=s=>document.querySelector(s);
 const urlEl=q("#url"),qualityEl=q("#quality"),containerEl=q("#container"),ttlEl=q("#ttl"),metaBtn=q("#metaBtn"),downloadBtn=q("#downloadBtn"),preview=q("#preview"),jobsEl=q("#jobs");
@@ -491,7 +509,14 @@ async function poll(){
     }catch(e){jobsEl.innerHTML='<div class="error">'+esc(e.message)+'</div>'}
 }
 
-async function delv(e,id){
+async function saveBots(){
+ const d=await apiFetch("/api/bots",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({telegram_enabled:q("#tgEnabled").checked,telegram_token:q("#tgToken").value,vk_enabled:q("#vkEnabled").checked,vk_token:q("#vkToken").value,vk_group_id:q("#vkGroup").value,bot_access_key:q("#botKey").value})});
+ q("#botKey").value=d.bot_access_key;q("#tgToken").value="";q("#vkToken").value="";q("#botStatus").textContent="Настройки сохранены.";
+}
+async function rotateBotKey(){
+ const d=await apiFetch("/api/bots",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({rotate_access_key:true})});
+ q("#botKey").value=d.bot_access_key;q("#botStatus").textContent="Ключ заменён.";
+}async function delv(e,id){
     e.preventDefault();e.stopPropagation();
     if(!confirm("Удалить видео с сервера?"))return;
     try{await apiFetch("/api/videos/"+encodeURIComponent(id),{method:"DELETE"});location.reload()}catch(err){alert(err.message)}
