@@ -159,7 +159,7 @@ def tg_container_keyboard():
 def tg_ttl_keyboard():
     return [[{"text":"12 часов","callback_data":"t:12"},{"text":"24 часа","callback_data":"t:24"}],[{"text":"3 дня","callback_data":"t:72"},{"text":"7 дней","callback_data":"t:168"}],[{"text":"30 дней","callback_data":"t:720"},{"text":"Бессрочно","callback_data":"t:never"}]]
 
-def bot_start_download(platform,user_id,url,reply):
+def bot_start_download(platform,user_id,chat_id,url,reply):
     try:
         validate_url(url)
         reply("Получаю метаданные...")
@@ -182,11 +182,11 @@ def bot_payload(raw):
 
 def bot_video_rows(user_id,limit=8,offset=0):
     with connect() as c:
-        return c.execute("SELECT id,title,filesize,duration,height,created_at,expires_at FROM videos WHERE bot_platform='telegram' AND bot_user_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",(str(user_id),limit,offset)).fetchall()
+        return c.execute("SELECT id,title,filesize,duration,height,created_at,expires_at FROM videos ORDER BY created_at DESC LIMIT ? OFFSET ?",(limit,offset)).fetchall()
 
 def bot_videos_text(rows,offset=0):
-    if not rows:return "📚 Твоих сохранённых видео пока нет."
-    lines=["📚 Твои видео:",""]
+    if not rows:return "📚 На сервере пока нет сохранённых видео."
+    lines=["📚 Все видео на сервере:",""]
     for n,v in enumerate(rows,offset+1):
         lines.append("%d. %s · %.1f MB"%(n,v["title"],(v["filesize"] or 0)/1024/1024))
     return "\n".join(lines)
@@ -196,10 +196,10 @@ def telegram_library_keyboard(rows):
     if rows:buttons.append([{"text":"📚 Обновить список","callback_data":"videos:1"}])
     return buttons
 
-def bot_send_video(token,chat_id,vid,user_id):
+def bot_send_video(token,chat_id,vid,user_id=None):
     base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
     if not base:return False
-    with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=? AND bot_platform='telegram' AND bot_user_id=?",(vid,str(user_id))).fetchone()
+    with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=?",(vid,)).fetchone()
     if not v or not (MEDIA/v["filename"]).is_file():return False
     try:
         d=telegram_call(token,"sendVideo",{"chat_id":chat_id,"video":base+"/media/"+vid,"caption":v["title"][:1024],"supports_streaming":True})
@@ -239,13 +239,15 @@ def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
     if not parts:return
     cmd=parts[0].split("@",1)[0].lower()
     if cmd in {"/start","/help","help"}:
-        reply("inhHAB bot.\n\n/access KEY — открыть доступ\n/videos — мои сохранённые видео\n/status — статус загрузок\n\nПосле авторизации отправь ссылку на YouTube или PornHub.");return
+        reply("inhHAB bot.\n\n/access KEY — открыть доступ\n/videos — все видео на сервере\n/status — статус загрузок\n\nПосле авторизации отправь ссылку на YouTube или PornHub.");return
     if cmd in {"/access","/key"}:
         if len(parts)<2:reply("Использование: /access KEY");return
         reply("Доступ выдан. Теперь просто отправь ссылку." if bot_authorize(platform,user_id,parts[1]) else "Неверный ключ доступа.");return
     if not bot_user_allowed(platform,user_id):
         reply("Доступ закрыт. Сначала введи /access KEY.");return
     if cmd in {"/videos","/library"}:
+        if not bot_user_allowed(platform,user_id):
+            reply("Доступ закрыт. Сначала введи /access KEY.");return
         rows=bot_video_rows(user_id);reply(bot_videos_text(rows),telegram_library_keyboard(rows));return
     if cmd=="/status":
         with connect() as c:rows=c.execute("SELECT status,COUNT(*) n FROM jobs WHERE id IN (SELECT job_id FROM bot_requests WHERE platform='telegram' AND user_id=?) GROUP BY status",(str(user_id),)).fetchall()
