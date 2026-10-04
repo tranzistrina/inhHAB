@@ -71,6 +71,32 @@
 
 PORT, HOST, WAITRESS_THREADS, SESSION_SECRET, COOKIE_SECURE, ADMIN_SETUP_CODE, YTDLP_COOKIEFILE, YTDLP_USER_AGENT, YTDLP_SOCKET_TIMEOUT и MAX_UPLOAD_BYTES.
 
+## Зависимости для macOS
+
+Текущий yt-dlp требует современный Python; для этого проекта используется Python 3.11+.
+
+    brew install python@3.13
+    brew install deno
+    brew install ffmpeg
+
+`run_mac.sh` автоматически пересоздаст `.venv`, если старое окружение было создано на Python 3.9/3.10.
+
+## YouTube
+
+Современный YouTube требует JavaScript runtime для полноценной работы yt-dlp. В проекте используется `yt-dlp[default]`, включая EJS; на macOS рекомендуется Deno.
+
+При ошибке `The page needs to be reloaded` приложение повторяет YouTube-запрос с `player_client=default,web_embedded`, включая случай использования `YTDLP_COOKIEFILE`.
+
+Некоторые ролики YouTube могут дополнительно требовать актуальный PO Token. Это ограничение самого YouTube/yt-dlp.
+
+## PornHub
+
+Поддерживаются ссылки вида:
+
+    https://rt.pornhub.org/view_video.php?viewkey=68420c412dc72
+
+Перед передачей в yt-dlp ссылки `rt.pornhub.org` нормализуются к каноническому `www.pornhub.com` с сохранением пути и `viewkey`.
+
 ## Ограничение области
 
 Приложение разрешает URL только YouTube и PornHub и не пытается обходить DRM или платный доступ. Поддержка конкретного URL зависит от актуального extractor-а yt-dlp.
