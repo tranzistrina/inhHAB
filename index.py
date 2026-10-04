@@ -185,6 +185,20 @@ def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
     text=(text or "").strip();parts=text.split()
     if payload:
         action=payload.get("inhhab");value=str(payload.get("value",""))
+        if action=="t":
+            ttl_map={"12":"12","24":"24","72":"72","168":"168","720":"720","never":"never"}
+            if value not in ttl_map: reply("Некорректный срок хранения."); return
+            save_bot_session(platform,user_id,ttl_hours=ttl_value(ttl_map[value]))
+            s=bot_session(platform,user_id);q=s["quality"] or "best";container=s["container"] or "mp4";label="бессрочно" if s["ttl_hours"] is None else str(s["ttl_hours"])+" ч."
+            keyboard=[[{"text":"⬇️ Скачать","callback_data":"go:1"}]]
+            reply("Готово к загрузке.\\nКачество: %s\\nФормат: %s\\nХранение: %s"%(q+"p" if q!="best" else "лучшее",container.upper(),label),keyboard)
+            return
+        if action=="go":
+            try:
+                jid=bot_create_job(platform,user_id)
+                reply("Задача добавлена: "+jid+"\\nЯ сообщу, когда видео будет готово.")
+            except Exception as e: reply("Ошибка: "+str(e))
+            return
         if action=="q":
             save_bot_session(platform,user_id,quality=value)
             reply("Качество: %sp\\nТеперь выбери формат:"%value,tg_container_keyboard() if platform=="telegram" else vk_text_buttons(["MP4","WebM"]))
