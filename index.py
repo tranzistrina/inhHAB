@@ -77,6 +77,8 @@ def setting(k):
     with connect() as c:r=c.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone()
     return r["value"] if r else None
 def configured():return bool(setting("admin_password_hash"))
+def set_setting(k,v):
+    with connect() as c:c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(k,str(v)))
 def bot_access_key():
     v=setting("bot_access_key")
     if v:return v
