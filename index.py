@@ -5,6 +5,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -13,6 +14,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
+
+if sys.version_info < (3, 11):
+    raise RuntimeError("inhHAB requires Python 3.11 or newer. Run ./run_mac.sh to recreate the virtual environment.")
 
 import yt_dlp
 from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, session, url_for
@@ -145,9 +149,6 @@ def ydl_base():
     else:
         log.warning("No supported yt-dlp JS runtime found (install Deno or Node for full YouTube support).")
     return o
-
-def is_youtube_reload_error(exc):
-    return source_name(str(getattr(exc,"url","")) or "")=="YouTube" and "page needs to be reloaded" in str(exc).lower()
 
 def info_for(url):
     normalized=canonical_url(url)
@@ -510,5 +511,6 @@ poll();setInterval(poll,2000);
 if __name__=="__main__":
     host=os.getenv("HOST","127.0.0.1");port=int(os.getenv("PORT","1616"));threads=int(os.getenv("WAITRESS_THREADS","8"))
     log.info("inhHAB listening on http://%s:%s",host,port)
+    log.info("Python: %s | yt-dlp: %s",sys.version.split()[0],getattr(yt_dlp,"version","unknown"))
     log.info("ADMIN_SETUP_CODE: %s", "configured" if os.getenv("ADMIN_SETUP_CODE") else "auto-generated on first setup")
     serve(app,host=host,port=port,threads=threads)
