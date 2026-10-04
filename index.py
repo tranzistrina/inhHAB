@@ -1,6 +1,7 @@
 import logging
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import shutil
@@ -107,7 +108,10 @@ def telegram_call(token,method,payload):return http_json("https://api.telegram.o
 def telegram_send(token,chat_id,text):return telegram_call(token,"sendMessage",{"chat_id":chat_id,"text":text})
 
 def vk_api(token,method,payload):
-    p=dict(payload or {});p.update({"access_token":token,"v":"5.199"});return http_json("https://api.vk.com/method/"+method,p)
+    p=dict(payload or {});p.update({"access_token":token,"v":"5.199"})
+    data=urllib.parse.urlencode(p).encode("utf-8")
+    req=urllib.request.Request("https://api.vk.com/method/"+method,data=data,headers={"Content-Type":"application/x-www-form-urlencoded","User-Agent":"inhHAB/1.0"})
+    with urllib.request.urlopen(req,timeout=35) as r:return json.loads(r.read().decode("utf-8"))
 def vk_send(token,peer_id,text):return vk_api(token,"messages.send",{"peer_id":peer_id,"random_id":0,"message":text})
 
 def notify_bot_request(job_id,text):
@@ -162,10 +166,16 @@ def telegram_loop():
 def vk_loop():
     ts=server=key=None
     while True:
-        token=setting("vk_token");group_id=setting("vk_group_id")
-        if not token or not group_id or not bot_enabled("vk"):time.sleep(3);continue
+        token=setting("vk_token")
+        if not token or not bot_enabled("vk"):time.sleep(3);continue
         try:
             if not server:
+                g=vk_api(token,"groups.getById",{})
+                if "error" in g:raise RuntimeError(str(g["error"]))
+                groups=(g.get("response") or {}).get("groups") or []
+                if not groups:raise RuntimeError("VK token не привязан к сообществу.")
+                group_id=str(groups[0].get("id") or "")
+                if not group_id:raise RuntimeError("VK API не вернул ID сообщества.")
                 d=vk_api(token,"groups.getLongPollServer",{"group_id":group_id})
                 if "error" in d:raise RuntimeError(str(d["error"]))
                 server=d["response"]["server"];key=d["response"]["key"];ts=d["response"]["ts"]
@@ -545,7 +555,7 @@ a{color:inherit;text-decoration:none}.mt{margin-top:18px}
 <div class="panel mt"><div class="row"><h2>Очередь</h2><a href="/logout">выйти</a></div><div id="jobs"></div></div>
 <div class="row mt"><h2>Видео на сервере</h2></div>
 <div class="grid">{% for v in videos %}<a class="card" href="/video/{{v["id"]}}">{% if v["thumbnail"] %}<img class="thumb" src="/thumb/{{v["id"]}}">{% else %}<div class="thumb"></div>{% endif %}<b>{{v["title"]}}</b><div class="muted">{{v["source"]}} · {{v["height"] or "?"}}p</div><button onclick="delv(event,'{{v["id"]}}')">удалить</button></a>{% else %}<div class="card muted">Видео пока нет.</div>{% endfor %}</div>
-<div class="panel mt"><h2>Боты Telegram / VK</h2><p class="muted">Пользователь сначала отправляет боту <b>/access КЛЮЧ</b>, после чего получает доступ к /download и /status.</p><div class="grid"><div><h3>Telegram</h3><label><input id="tgEnabled" type="checkbox" {% if bot_settings.telegram_enabled %}checked{% endif %}> включён</label><input id="tgToken" type="password" placeholder="{% if bot_settings.telegram_token %}токен сохранён, введите новый для замены{% else %}BotFather token{% endif %}" autocomplete="off"></div><div><h3>VK</h3><label><input id="vkEnabled" type="checkbox" {% if bot_settings.vk_enabled %}checked{% endif %}> включён</label><input id="vkToken" type="password" placeholder="{% if bot_settings.vk_token %}токен сохранён, введите новый для замены{% else %}токен сообщества{% endif %}"><input id="vkGroup" value="{{bot_settings.vk_group_id}}" placeholder="ID сообщества"></div></div><div class="row mt"><div><b>Ключ доступа ботов</b><div class="muted">Его вводят пользователи командой /access КЛЮЧ.</div></div><input id="botKey" value="{{bot_settings.bot_access_key}}" style="flex:1" autocomplete="off"><button type="button" onclick="rotateBotKey()">новый ключ</button><button type="button" class="primary" onclick="saveBots()">сохранить</button></div><div id="botStatus" class="muted mt"></div></div><div class="panel mt"><h2>Ручная загрузка</h2><form id="upload"><input name="file" type="file" accept="video/*" required><select name="ttl_hours"><option value="12">12 часов</option><option value="24">24 часа</option><option value="168">7 дней</option><option value="never">Бессрочно</option></select><button>загрузить</button></form></div>
+<div class="panel mt"><h2>Боты Telegram / VK</h2><p class="muted">Пользователь сначала отправляет боту <b>/access КЛЮЧ</b>, после чего получает доступ к /download и /status.</p><div class="grid"><div><h3>Telegram</h3><label><input id="tgEnabled" type="checkbox" {% if bot_settings.telegram_enabled %}checked{% endif %}> включён</label><input id="tgToken" type="password" placeholder="{% if bot_settings.telegram_token %}токен сохранён, введите новый для замены{% else %}BotFather token{% endif %}" autocomplete="off"></div><div><h3>VK</h3><label><input id="vkEnabled" type="checkbox" {% if bot_settings.vk_enabled %}checked{% endif %}> включён</label><input id="vkToken" type="password" placeholder="{% if bot_settings.vk_token %}токен сохранён, введите новый для замены{% else %}токен сообщества{% endif %}"></div></div><div class="row mt"><div><b>Ключ доступа ботов</b><div class="muted">Его вводят пользователи командой /access КЛЮЧ.</div></div><input id="botKey" value="{{bot_settings.bot_access_key}}" style="flex:1" autocomplete="off"><button type="button" onclick="rotateBotKey()">новый ключ</button><button type="button" class="primary" onclick="saveBots()">сохранить</button></div><div id="botStatus" class="muted mt"></div></div><div class="panel mt"><h2>Ручная загрузка</h2><form id="upload"><input name="file" type="file" accept="video/*" required><select name="ttl_hours"><option value="12">12 часов</option><option value="24">24 часа</option><option value="168">7 дней</option><option value="never">Бессрочно</option></select><button>загрузить</button></form></div>
 <script>
 const q=s=>document.querySelector(s);
 const urlEl=q("#url"),qualityEl=q("#quality"),containerEl=q("#container"),ttlEl=q("#ttl"),metaBtn=q("#metaBtn"),downloadBtn=q("#downloadBtn"),preview=q("#preview"),jobsEl=q("#jobs");
@@ -612,7 +622,7 @@ async function poll(){
 }
 
 async function saveBots(){
- const d=await apiFetch("/api/bots",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({telegram_enabled:q("#tgEnabled").checked,telegram_token:q("#tgToken").value,vk_enabled:q("#vkEnabled").checked,vk_token:q("#vkToken").value,vk_group_id:q("#vkGroup").value,bot_access_key:q("#botKey").value})});
+ const d=await apiFetch("/api/bots",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({telegram_enabled:q("#tgEnabled").checked,telegram_token:q("#tgToken").value,vk_enabled:q("#vkEnabled").checked,vk_token:q("#vkToken").value,bot_access_key:q("#botKey").value})});
  q("#botKey").value=d.bot_access_key;q("#tgToken").value="";q("#vkToken").value="";q("#botStatus").textContent="Настройки сохранены.";
 }
 async function rotateBotKey(){
