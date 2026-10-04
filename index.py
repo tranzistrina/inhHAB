@@ -170,58 +170,74 @@ def tg_container_keyboard():
 def tg_ttl_keyboard():
     return [[{"text":"12 часов","callback_data":"t:12"},{"text":"24 часа","callback_data":"t:24"}],[{"text":"3 дня","callback_data":"t:72"},{"text":"7 дней","callback_data":"t:168"}],[{"text":"30 дней","callback_data":"t:720"},{"text":"Бессрочно","callback_data":"t:never"}]]
 
-def vk_buttons(options):
-    return [[{"action":{"type":"text","label":str(q)+"p","payload":json.dumps({"inhhab":"q","value":str(q)})}} for q in options[:6]]]
+def vk_buttons(options,action="q"):
+    return [[{"action":{"type":"text","label":str(q)+"p","payload":json.dumps({"cmd":action,"value":str(q)})}} for q in options[:6]]]
 
-def vk_text_buttons(labels):
-    return [[{"action":{"type":"text","label":x,"payload":json.dumps({"inhhab":"text","value":x})}} for x in labels]]
+def vk_choice_buttons(items,action):
+    return [[{"action":{"type":"text","label":label,"payload":json.dumps({"cmd":action,"value":value})}} for label,value in items]]
 
 def bot_start_download(platform,user_id,url,reply):
     try:
         validate_url(url)
-        reply("Получаю метаданные…")
+        reply("Получаю метаданные...")
         info=info_for(url)
         opts=bot_quality_options(info)
         save_bot_session(platform,user_id,url=url,title=info.get("title") or "",qualities_json=json.dumps(opts))
+        title=(info.get("title") or "без названия").strip()
         if platform=="telegram":
-            reply("Видео: %s\\nВыбери качество:"%(info.get("title") or "без названия"),tg_quality_keyboard(opts))
+            reply("Видео: "+title+"\n\nВыбери качество:",tg_quality_keyboard(opts))
         else:
-            reply("Видео: %s\\nВыбери качество:"%(info.get("title") or "без названия"),vk_buttons(opts))
+            reply("Видео: "+title+"\n\nВыбери качество:",vk_buttons(opts))
     except Exception as e:
         reply("Ошибка получения метаданных: "+str(e))
 
+def bot_payload(raw):
+    if isinstance(raw,dict):return raw
+    if not raw:return None
+    try:
+        p=json.loads(raw)
+        if isinstance(p,dict):return p
+    except Exception:pass
+    return None
+
 def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
     text=(text or "").strip();parts=text.split()
+    payload=bot_payload(payload)
     if payload:
-        action=payload.get("inhhab");value=str(payload.get("value",""))
+        action=str(payload.get("cmd") or payload.get("inhhab") or "")
+        value=str(payload.get("value",""))
+        if action=="q":
+            save_bot_session(platform,user_id,quality=value)
+            keyboard=tg_container_keyboard() if platform=="telegram" else vk_choice_buttons([("MP4","mp4"),("WebM","webm")],"c")
+            reply("Качество: "+value+"p\n\nТеперь выбери формат:",keyboard)
+            return
+        if action=="c":
+            if value not in {"mp4","webm"}:reply("Некорректный формат.");return
+            save_bot_session(platform,user_id,container=value)
+            items=[("12 часов","12"),("24 часа","24"),("3 дня","72"),("7 дней","168"),("30 дней","720"),("Бессрочно","never")]
+            keyboard=tg_ttl_keyboard() if platform=="telegram" else vk_choice_buttons(items,"t")
+            reply("Формат: "+value.upper()+"\n\nТеперь выбери срок хранения:",keyboard)
+            return
         if action=="t":
             ttl_map={"12":"12","24":"24","72":"72","168":"168","720":"720","never":"never"}
-            if value not in ttl_map: reply("Некорректный срок хранения."); return
+            if value not in ttl_map:reply("Некорректный срок хранения.");return
             save_bot_session(platform,user_id,ttl_hours=ttl_value(ttl_map[value]))
             s=bot_session(platform,user_id);q=s["quality"] or "best";container=s["container"] or "mp4";label="бессрочно" if s["ttl_hours"] is None else str(s["ttl_hours"])+" ч."
-            keyboard=[[{"text":"⬇️ Скачать","callback_data":"go:1"}]]
-            reply("Готово к загрузке.\\nКачество: %s\\nФормат: %s\\nХранение: %s"%(q+"p" if q!="best" else "лучшее",container.upper(),label),keyboard)
+            keyboard=[[{"text":"⬇️ Скачать","callback_data":"go:1"}]] if platform=="telegram" else vk_choice_buttons([("⬇️ Скачать","1")],"go")
+            reply("Готово к загрузке.\n\nКачество: "+(q+"p" if q!="best" else "лучшее")+"\nФормат: "+container.upper()+"\nХранение: "+label,keyboard)
             return
         if action=="go":
             try:
                 jid=bot_create_job(platform,user_id)
-                reply("Задача добавлена: "+jid+"\\nЯ сообщу, когда видео будет готово.")
-            except Exception as e: reply("Ошибка: "+str(e))
-            return
-        if action=="q":
-            save_bot_session(platform,user_id,quality=value)
-            reply("Качество: %sp\\nТеперь выбери формат:"%value,tg_container_keyboard() if platform=="telegram" else vk_text_buttons(["MP4","WebM"]))
-            return
-        if action=="text" and value in {"MP4","WebM"}:
-            save_bot_session(platform,user_id,container=value.lower())
-            reply("Формат: %s\\nТеперь выбери срок хранения:"%value,tg_ttl_keyboard() if platform=="telegram" else vk_text_buttons(["12 часов","24 часа","3 дня","7 дней","30 дней","Бессрочно"]))
+                reply("Задача добавлена: "+jid+"\n\nЯ сообщу, когда видео будет готово.")
+            except Exception as e:reply("Ошибка: "+str(e))
             return
     if not parts:
         if text.startswith("http"):return bot_start_download(platform,user_id,text,reply)
         return
     cmd=parts[0].split("@",1)[0].lower()
     if cmd in {"/start","/help","help"}:
-        reply("inhHAB bot.\\nДоступ: /access KEY\\nПросто отправь ссылку на YouTube или PornHub, после чего бот даст кнопки качества, формата и срока хранения.");return
+        reply("inhHAB bot.\n\nДоступ: /access KEY\n\nПосле авторизации просто отправь ссылку на YouTube или PornHub. Бот сам предложит качество, формат и срок хранения.");return
     if cmd in {"/access","/key"}:
         if len(parts)<2:reply("Использование: /access KEY");return
         reply("Доступ выдан. Теперь просто отправь ссылку." if bot_authorize(platform,user_id,parts[1]) else "Неверный ключ доступа.");return
@@ -232,15 +248,9 @@ def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
         with connect() as c:rows=c.execute("SELECT status,COUNT(*) n FROM jobs WHERE id IN (SELECT job_id FROM bot_requests WHERE platform=? AND user_id=?) GROUP BY status",(platform,str(user_id))).fetchall()
         reply("Твои задачи: "+"; ".join("%s=%s"%(r["status"],r["n"]) for r in rows) or "задач нет");return
     if text in {"MP4","WebM"}:
-        save_bot_session(platform,user_id,container=text.lower());reply("Формат: %s\\nВыбери срок хранения:"%text,vk_text_buttons(["12 часов","24 часа","3 дня","7 дней","30 дней","Бессрочно"]) if platform=="vk" else tg_ttl_keyboard());return
-    ttl_map={"12 часов":"12","24 часа":"24","3 дня":"72","7 дней":"168","30 дней":"720","Бессрочно":"never"}
-    if text in ttl_map:
-        save_bot_session(platform,user_id,ttl_hours=ttl_value(ttl_map[text]))
-        s=bot_session(platform,user_id);q=s["quality"] or "best";container=s["container"] or "mp4";label="бессрочно" if s["ttl_hours"] is None else str(s["ttl_hours"])+" ч."
-        keyboard=[[{"text":"⬇️ Скачать","callback_data":"go:1"}]] if platform=="telegram" else vk_text_buttons(["⬇️ Скачать"])
-        reply("Готово к загрузке.\\nКачество: %s\\nФормат: %s\\nХранение: %s"%(q+"p" if q!="best" else "лучшее",container.upper(),label),keyboard);return
+        save_bot_session(platform,user_id,container=text.lower());reply("Формат: "+text+"\n\nВыбери срок хранения:",vk_choice_buttons([("12 часов","12"),("24 часа","24"),("3 дня","72"),("7 дней","168"),("30 дней","720"),("Бессрочно","never")],"t") if platform=="vk" else tg_ttl_keyboard());return
     if text=="⬇️ Скачать":
-        try:jid=bot_create_job(platform,user_id);reply("Задача добавлена: "+jid+"\\nЯ сообщу, когда видео будет готово.")
+        try:jid=bot_create_job(platform,user_id);reply("Задача добавлена: "+jid+"\n\nЯ сообщу, когда видео будет готово.")
         except Exception as e:reply("Ошибка: "+str(e))
         return
     reply("Отправь ссылку или используй /help")
