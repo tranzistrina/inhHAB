@@ -159,12 +159,6 @@ def tg_container_keyboard():
 def tg_ttl_keyboard():
     return [[{"text":"12 часов","callback_data":"t:12"},{"text":"24 часа","callback_data":"t:24"}],[{"text":"3 дня","callback_data":"t:72"},{"text":"7 дней","callback_data":"t:168"}],[{"text":"30 дней","callback_data":"t:720"},{"text":"Бессрочно","callback_data":"t:never"}]]
 
-def vk_buttons(options,action="q"):
-    return [[{"action":{"type":"text","label":str(q)+"p","payload":json.dumps({"cmd":action,"value":str(q)})}} for q in options[:6]]]
-
-def vk_choice_buttons(items,action):
-    return [[{"action":{"type":"text","label":label,"payload":json.dumps({"cmd":action,"value":value})}} for label,value in items]]
-
 def bot_start_download(platform,user_id,url,reply):
     try:
         validate_url(url)
@@ -173,10 +167,7 @@ def bot_start_download(platform,user_id,url,reply):
         opts=bot_quality_options(info)
         save_bot_session(platform,user_id,url=url,title=info.get("title") or "",qualities_json=json.dumps(opts))
         title=(info.get("title") or "без названия").strip()
-        if platform=="telegram":
-            reply("Видео: "+title+"\n\nВыбери качество:",tg_quality_keyboard(opts))
-        else:
-            reply("Видео: "+title+"\n\nВыбери качество:",vk_buttons(opts))
+        reply("Видео: "+title+"\n\nВыбери качество:",tg_quality_keyboard(opts))
     except Exception as e:
         reply("Ошибка получения метаданных: "+str(e))
 
@@ -501,7 +492,7 @@ def login():
 def logout():log.info("admin logout");session.clear();return redirect(url_for("login"))
 @app.route("/")
 def index():
-    bot_settings={"telegram_enabled":setting("telegram_enabled")=="1","telegram_token":setting("telegram_token") or "","vk_enabled":setting("vk_enabled")=="1","vk_token":setting("vk_token") or "","vk_group_id":setting("vk_group_id") or "","bot_access_key":bot_access_key()}
+    bot_settings={"telegram_enabled":setting("telegram_enabled")=="1","telegram_token":setting("telegram_token") or "","bot_access_key":bot_access_key(),"public_base_url":setting("public_base_url") or os.getenv("PUBLIC_BASE_URL","")}
     with connect() as c:videos=c.execute("SELECT * FROM videos ORDER BY created_at DESC").fetchall();jobs=c.execute("SELECT * FROM jobs WHERE status IN ('queued','downloading','error') ORDER BY created_at DESC LIMIT 30").fetchall()
     return render_template_string(PAGE,page="index",videos=videos,jobs=jobs,bot_settings=bot_settings)
 @app.route("/api/bots",methods=["GET","POST"])
