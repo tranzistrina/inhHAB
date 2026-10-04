@@ -265,36 +265,46 @@ def telegram_library_keyboard(rows):
     if rows:buttons.append([{"text":"📚 Обновить список","callback_data":"videos:1"}])
     return buttons
 
-def bot_send_video(token,chat_id,vid,user_id=None):
-    with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=?",(vid,)).fetchone()
-    if not v:return False,"Видео не найдено."
-    path=MEDIA/v["filename"]
-    if not path.is_file():return False,"Файл видео отсутствует на диске."
+def telegram_send_local_file(token,chat_id,path,title,duration=None,width=None,height=None,performer=None):
+    path=Path(path)
+    if not path.is_file():return False,"Файл отсутствует."
     size=path.stat().st_size
-    if size>50*1024*1024:
-        return False,"Видео %.1f МБ. Telegram Bot API сейчас не принимает прямую отправку видео ботом больше 50 МБ."%(size/1024/1024)
+    limit=telegram_upload_limit_bytes()
+    if size>limit:
+        return False,"Файл %.1f МБ больше лимита Telegram API %.0f МБ."%(size/1024/1024,limit/1024/1024)
     import http.client
+    parsed=urllib.parse.urlsplit(telegram_api_base())
+    conn_cls=http.client.HTTPSConnection if parsed.scheme=="https" else http.client.HTTPConnection
+    base_path=(parsed.path or "").rstrip("/")
     boundary="----inhHAB_%s"%uuid.uuid4().hex
-    send_video=path.suffix.lower()==".mp4"
-    method="sendVideo" if send_video else "sendDocument"
-    field_name="video" if send_video else "document"
-    fields=[("chat_id",str(chat_id)),("caption",str(v["title"])[:1024])]
-    if send_video:
+    suffix=path.suffix.lower()
+    if suffix==".mp3":
+        method="sendAudio";field_name="audio"
+    elif suffix==".mp4":
+        method="sendVideo";field_name="video"
+    else:
+        method="sendDocument";field_name="document"
+    fields=[("chat_id",str(chat_id)),("caption",str(title)[:1024])]
+    if method=="sendVideo":
         fields.append(("supports_streaming","true"))
-        if v["duration"] is not None:fields.append(("duration",str(int(v["duration"]))))
-        if v["width"] is not None:fields.append(("width",str(int(v["width"]))))
-        if v["height"] is not None:fields.append(("height",str(int(v["height"]))))
+        if duration is not None:fields.append(("duration",str(int(duration))))
+        if width is not None:fields.append(("width",str(int(width))))
+        if height is not None:fields.append(("height",str(int(height))))
+    elif method=="sendAudio":
+        if duration is not None:fields.append(("duration",str(int(duration))))
+        if performer:fields.append(("performer",str(performer)[:256]))
+        fields.append(("title",str(title)[:256]))
     chunks=[]
     for name,value in fields:
         chunks.append(("--"+boundary+"\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"%(name,value)).encode("utf-8"))
-    mime=v["mime_type"] or "application/octet-stream"
+    mime=mime_for_path(path)
     file_head=("--"+boundary+"\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n"%(field_name,path.name,mime)).encode("utf-8")
     file_tail=("\r\n--"+boundary+"--\r\n").encode("utf-8")
     content_length=sum(len(x) for x in chunks)+len(file_head)+size+len(file_tail)
     conn=None
     try:
-        conn=http.client.HTTPSConnection("api.telegram.org",timeout=300)
-        conn.putrequest("POST","/bot%s/%s"%(token,method))
+        conn=conn_cls(parsed.netloc,timeout=900)
+        conn.putrequest("POST",base_path+"/bot%s/%s"%(token,method))
         conn.putheader("Content-Type","multipart/form-data; boundary=%s"%boundary)
         conn.putheader("Content-Length",str(content_length))
         conn.putheader("User-Agent","inhHAB/1.0")
@@ -307,20 +317,26 @@ def bot_send_video(token,chat_id,vid,user_id=None):
                 if not chunk:break
                 conn.send(chunk)
         conn.send(file_tail)
-        response=conn.getresponse()
-        raw=response.read().decode("utf-8","replace")
+        response=conn.getresponse();raw=response.read().decode("utf-8","replace")
         data=json.loads(raw)
         if data.get("ok"):return True,""
-        reason=data.get("description","Telegram не принял видео.")
-        log.warning("Telegram direct video upload failed: %s",reason)
+        reason=data.get("description","Telegram не принял файл.")
+        log.warning("Telegram local file upload failed: %s",reason)
         return False,reason
     except Exception as e:
-        log.warning("Telegram direct video upload failed: %s",e)
+        log.warning("Telegram local file upload failed: %s",e)
         return False,str(e)
     finally:
         if conn:
             try:conn.close()
             except Exception:pass
+
+def bot_send_video(token,chat_id,vid,user_id=None):
+    with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=?",(vid,)).fetchone()
+    if not v:return False,"Медиафайл не найден."
+    path=MEDIA/v["filename"]
+    if not path.is_file():return False,"Файл отсутствует на диске."
+    return telegram_send_local_file(token,chat_id,path,v["title"],v["duration"],v["width"],v["height"],v["uploader"])
 
 def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
     text=(text or "").strip();parts=text.split()
@@ -403,22 +419,37 @@ def notify_bot_request(job_id,text):
     except Exception as e:log.warning("bot notification failed: %s",e)
 
 def notify_bot_video(job_id,vid,title):
-    with connect() as c:r=c.execute("SELECT platform,user_id,chat_id,progress_message_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
+    with connect() as c:r=c.execute("SELECT platform,user_id,chat_id,progress_message_id,split_size_mb FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
     if not r or r["platform"]!="telegram" or not setting("telegram_token"):return
     chat_id=r["chat_id"] or r["user_id"];token=setting("telegram_token")
+    temp_dir=None
     try:
+        with connect() as c:v=c.execute("SELECT * FROM videos WHERE id=?",(vid,)).fetchone()
+        if not v:raise FileNotFoundError("Медиафайл не найден.")
+        path=MEDIA/v["filename"]
         if r["progress_message_id"]:
-            telegram_edit(token,chat_id,r["progress_message_id"],"✅ Скачивание завершено.\n\n📤 Отправляю видео в Telegram…")
-        sent,reason=bot_send_video(token,chat_id,vid,r["user_id"])
-        if sent:
-            telegram_send(token,chat_id,"Готово: "+title+"\n\nВидео отправлено прямо сюда.",[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
-        else:
-            base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
-            if base:
-                telegram_send(token,chat_id,"Готово: "+title+"\n\nОткрой просмотр:",[[{"text":"▶️ Смотреть","url":bot_signed_url(base,"media",vid,86400)},{"text":"⬇️ Скачать","url":bot_signed_url(base,"download",vid,86400)}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
-            else:
-                telegram_send(token,chat_id,"Видео скачано, но Telegram не принял прямую отправку.\n\n"+(reason or "Причина не указана.")+"\n\nДля файлов, которые больше лимита Telegram, укажи PUBLIC_BASE_URL.",[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
-    except Exception as e:log.warning("bot video notification failed: %s",e)
+            telegram_edit(token,chat_id,r["progress_message_id"],"✅ Скачивание завершено.\n\n📤 Подготавливаю отправку…")
+        parts=[path]
+        if int(r["split_size_mb"] or 0)>0 and path.suffix.lower()!=".mp3":
+            temp_dir=TMP/("telegram_"+job_id);temp_dir.mkdir(parents=True,exist_ok=True)
+            parts=split_video_for_telegram(path,temp_dir,int(r["split_size_mb"])*1024*1024)
+        if len(parts)>1:
+            telegram_send(token,chat_id,"✂️ Видео разделено на %d частей по 45 МБ."%len(parts))
+        for idx,part in enumerate(parts,1):
+            part_title=title if len(parts)==1 else "%s · часть %d/%d"%(title,idx,len(parts))
+            sent,reason=telegram_send_local_file(token,chat_id,part,part_title,v["duration"],v["width"],v["height"],v["uploader"])
+            if not sent:
+                base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
+                if base and len(parts)==1:
+                    telegram_send(token,chat_id,"Файл не удалось отправить напрямую. Открой по ссылке:",[[{"text":"▶️ Смотреть","url":bot_signed_url(base,"media",vid,86400)},{"text":"⬇️ Скачать","url":bot_signed_url(base,"download",vid,86400)}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+                    return
+                raise RuntimeError(reason or "Telegram не принял файл.")
+        telegram_send(token,chat_id,"Готово: "+title+"\n\n"+("Все части отправлены." if len(parts)>1 else "Файл отправлен прямо сюда."),[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+    except Exception as e:
+        log.warning("bot video notification failed: %s",e)
+        telegram_send(token,chat_id,"Скачивание завершено, но отправка в Telegram не удалась.\n\n"+str(e),[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+    finally:
+        if temp_dir:shutil.rmtree(temp_dir,ignore_errors=True)
 
 def notify_bot_progress(job_id,pct,eta=None,speed=None):
     r=bot_progress_message(job_id)
