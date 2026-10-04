@@ -107,7 +107,8 @@ def telegram_api_base():
     return (os.getenv("TELEGRAM_API_URL") or setting("telegram_api_url") or "https://api.telegram.org").strip().rstrip("/")
 
 def telegram_local_api_enabled():
-    return (os.getenv("TELEGRAM_LOCAL_API") or setting("telegram_local_api") or "0").strip().lower() in {"1","true","yes","on"}
+    flag=(os.getenv("TELEGRAM_LOCAL_API") or setting("telegram_local_api") or "0").strip().lower() in {"1","true","yes","on"}
+    return flag and telegram_api_base().rstrip("/")!="https://api.telegram.org"
 
 def telegram_upload_limit_bytes():
     return (2000*1024*1024) if telegram_local_api_enabled() else (50*1024*1024)
