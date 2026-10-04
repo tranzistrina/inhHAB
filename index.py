@@ -282,12 +282,26 @@ def handle_bot_text(platform,chat_id,user_id,text,reply,payload=None):
     reply("Отправь ссылку или используй /videos")
 
 def notify_bot_request(job_id,text):
-    with connect() as c:r=c.execute("SELECT platform,user_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
+    with connect() as c:r=c.execute("SELECT platform,user_id,chat_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
     if not r:return
     try:
-        if r["platform"]=="telegram" and setting("telegram_token"):telegram_send(setting("telegram_token"),r["user_id"],text)
-        elif r["platform"]=="vk" and setting("vk_token"):vk_send(setting("vk_token"),r["user_id"],text)
+        if r["platform"]=="telegram" and setting("telegram_token"):telegram_send(setting("telegram_token"),r["chat_id"] or r["user_id"],text)
     except Exception as e:log.warning("bot notification failed: %s",e)
+
+def notify_bot_video(job_id,vid,title):
+    with connect() as c:r=c.execute("SELECT platform,user_id,chat_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
+    if not r or r["platform"]!="telegram" or not setting("telegram_token"):return
+    chat_id=r["chat_id"] or r["user_id"];token=setting("telegram_token")
+    try:
+        if bot_send_video(token,chat_id,vid,r["user_id"]):
+            telegram_send(token,chat_id,"Готово: "+title+"\n\nВидео отправлено прямо сюда.",[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+        else:
+            base=(os.getenv("PUBLIC_BASE_URL") or setting("public_base_url") or "").strip().rstrip("/")
+            if base:
+                telegram_send(token,chat_id,"Готово: "+title+"\n\nОткрой просмотр:",[[{"text":"▶️ Смотреть","url":base+"/video/"+vid},{"text":"⬇️ Скачать","url":base+"/download/"+vid}],[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+            else:
+                telegram_send(token,chat_id,"Готово: "+title+"\n\nДля просмотра из Telegram настрой PUBLIC_BASE_URL.",[[{"text":"📚 Мои видео","callback_data":"videos:1"}]])
+    except Exception as e:log.warning("bot video notification failed: %s",e)
 
 def telegram_loop():
     offset=None;ready_token=None
@@ -474,9 +488,10 @@ def run_job(job_id):
             try:urllib.request.urlretrieve(info["thumbnail"],tp);thumb=tp.name
             except Exception:pass
         with connect() as c:
-            c.execute("INSERT INTO videos(id,title,source_url,source,filename,mime_type,filesize,duration,width,height,uploader,thumbnail,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(vid,(info.get("title") or final.stem).strip(),job["url"],source_name(job["url"]),final.name,"video/"+final.suffix.lstrip("."),final.stat().st_size,info.get("duration"),info.get("width"),info.get("height"),info.get("uploader") or info.get("channel"),thumb,iso(now()),expires(job["ttl_hours"])))
+            bot_owner=c.execute("SELECT platform,user_id,chat_id FROM bot_requests WHERE job_id=?",(job_id,)).fetchone()
+            c.execute("INSERT INTO videos(id,title,source_url,source,filename,mime_type,filesize,duration,width,height,uploader,thumbnail,created_at,expires_at,bot_platform,bot_user_id,bot_chat_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(vid,(info.get("title") or final.stem).strip(),job["url"],source_name(job["url"]),final.name,"video/"+final.suffix.lstrip("."),final.stat().st_size,info.get("duration"),info.get("width"),info.get("height"),info.get("uploader") or info.get("channel"),thumb,iso(now()),expires(job["ttl_hours"]),bot_owner["platform"] if bot_owner else None,bot_owner["user_id"] if bot_owner else None,bot_owner["chat_id"] if bot_owner else None))
             c.execute("UPDATE jobs SET status='done',progress=100,title=?,video_id=?,finished_at=? WHERE id=?",(info.get("title") or final.stem,vid,iso(now()),job_id))
-        notify_bot_request(job_id,"Готово: "+(info.get("title") or final.stem)+"\nВидео: /video/"+vid)
+        notify_bot_video(job_id,vid,(info.get("title") or final.stem).strip())
         log.info("job %s completed: %s",job_id,info.get("title") or final.stem)
     except Exception as e:
         msg=str(e)[-1600:];notify_bot_request(job_id,"Ошибка загрузки: "+msg[-1000:]);log.exception("job %s failed",job_id)
