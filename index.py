@@ -137,7 +137,7 @@ def handle_bot_text(platform,chat_id,user_id,text,reply):
             if container not in {"mp4","webm"}:raise ValueError("контейнер должен быть mp4 или webm")
             if q!="best" and not (1<=int(q)<=4320):raise ValueError("некорректное разрешение")
             ttlh=ttl_value(ttl);jid=uuid.uuid4().hex
-            with connect() as c:c.execute("INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,"queued",?)",(jid,url,q,container,ttlh,iso(now())))
+            with connect() as c:c.execute("INSERT INTO jobs(id,url,quality,container,ttl_hours,status,created_at) VALUES(?,?,?,?,?,'queued',?)",(jid,url,q,container,ttlh,iso(now())))
             bot_register_request(jid,platform,user_id);reply("Задача добавлена: "+jid+"\nСтатус: /status")
         except Exception as e:reply("Ошибка: "+str(e))
         return
